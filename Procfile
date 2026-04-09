@@ -1,1 +1,1 @@
-web: python src/dashboard/app.py
+web: python3.11 src/dashboard/app.py
