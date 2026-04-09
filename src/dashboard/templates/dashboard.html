@@ -224,6 +224,59 @@ a{color:#58a6ff}
 
   </div><!-- end row 3 -->
 
+  <!-- COMPOUNDING PANEL -->
+  <div class="row" style="grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-hdr"><h3>💰 Compounding Engine</h3><span id="riskBadge" style="background:#1a3a1a;color:#3fb950;border:1px solid #3fb950;padding:2px 8px;border-radius:10px;font-size:11px">10% risk/trade</span></div>
+      <div class="card-body">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+          <div style="background:#0d1117;border-radius:6px;padding:10px;text-align:center">
+            <div style="color:#8b949e;font-size:11px">Current Balance</div>
+            <div style="font-size:22px;font-weight:700;color:#3fb950" id="cmpBalance">$0.00</div>
+          </div>
+          <div style="background:#0d1117;border-radius:6px;padding:10px;text-align:center">
+            <div style="color:#8b949e;font-size:11px">Next Trade Margin</div>
+            <div style="font-size:22px;font-weight:700;color:#58a6ff" id="cmpMargin">$0.00</div>
+          </div>
+          <div style="background:#0d1117;border-radius:6px;padding:10px;text-align:center">
+            <div style="color:#8b949e;font-size:11px">Total Return</div>
+            <div style="font-size:18px;font-weight:700" id="cmpReturn">0%</div>
+          </div>
+          <div style="background:#0d1117;border-radius:6px;padding:10px;text-align:center">
+            <div style="color:#8b949e;font-size:11px">Total Trades</div>
+            <div style="font-size:18px;font-weight:700;color:#c9d1d9" id="cmpTrades">0</div>
+          </div>
+        </div>
+        <div class="met-row"><span class="met-label">Weekly Target</span><span class="met-val up" id="cmpWeeklyTarget">$0</span></div>
+        <div class="met-row"><span class="met-label">Weekly Profit</span><span class="met-val up" id="cmpWeeklyProfit">$0</span></div>
+        <div class="met-row"><span class="met-label">Trades Today</span><span class="met-val" id="cmpTradesToday">0</span></div>
+        <div class="met-row"><span class="met-label">Trades This Week</span><span class="met-val" id="cmpTradesWeek">0</span></div>
+        <div class="met-row"><span class="met-label">Win Rate</span><span class="met-val" id="cmpWinRate">0%</span></div>
+        <div class="met-row"><span class="met-label">Peak Balance</span><span class="met-val up" id="cmpPeak">$0</span></div>
+      </div>
+    </div>
+
+    <!-- Projection Table -->
+    <div class="card">
+      <div class="card-hdr"><h3>🚀 Growth Projection (1000 trades/week)</h3></div>
+      <div class="card-body" style="padding:0;overflow-x:auto">
+        <table class="tbl">
+          <thead><tr><th>Trades</th><th>Balance</th><th>Profit</th><th>Multiplier</th></tr></thead>
+          <tbody id="projTable">
+            <tr><td colspan="4" class="no-data">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="padding:10px;border-top:1px solid #30363d">
+        <div style="color:#8b949e;font-size:11px;text-align:center">Based on 60% win rate, 10% risk/trade, 1.5:1 reward:risk</div>
+        <div style="color:#d29922;font-size:11px;text-align:center;margin-top:4px">Target: 1000 trades/week = max compounding growth</div>
+      </div>
+    </div>
+
+  </div>
+
 </div><!-- end wrap -->
 
 <script>
@@ -300,6 +353,9 @@ function applyState(d) {
 
   // Trades
   updateTrades(d.recent_trades || []);
+
+  // Compounding
+  if (d.compounding) updateCompounding(d.compounding);
 }
 
 // ── SIGNAL ─────────────────────────────────────────────────
@@ -446,6 +502,42 @@ function drawChart(candles) {
     Plotly.react('chart',[candle,ema7trace,ema15trace,volTrace],layout,{responsive:true,displayModeBar:false});
   }
   document.getElementById('chartTs').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+// ── COMPOUNDING ────────────────────────────────────────────
+function updateCompounding(c) {
+  if (!c) return;
+  const ret = c.total_return_pct || 0;
+  document.getElementById('cmpBalance').textContent    = '$' + fmt(c.current_balance);
+  document.getElementById('cmpBalance').className      = ret >= 0 ? 'up' : 'dn';
+  document.getElementById('cmpMargin').textContent     = '$' + fmt(c.next_trade_margin);
+  document.getElementById('cmpReturn').textContent     = (ret >= 0 ? '+' : '') + ret.toFixed(1) + '%';
+  document.getElementById('cmpReturn').className       = ret >= 0 ? 'up' : 'dn';
+  document.getElementById('cmpTrades').textContent     = c.total_trades || 0;
+  document.getElementById('cmpPeak').textContent       = '$' + fmt(c.peak_balance);
+  document.getElementById('cmpWinRate').textContent    = (c.win_rate || 0).toFixed(1) + '%';
+
+  const wt = c.weekly_target || {};
+  document.getElementById('cmpWeeklyTarget').textContent  = '$' + fmt(wt.target_balance);
+  document.getElementById('cmpWeeklyProfit').textContent  = '+$' + fmt(wt.weekly_profit);
+  document.getElementById('cmpTradesToday').textContent   = wt.trades_today || 0;
+  document.getElementById('cmpTradesWeek').textContent    = wt.trades_this_week || 0;
+
+  // Projection table
+  const rows = c.projection || [];
+  const tbody = document.getElementById('projTable');
+  if (rows.length) {
+    tbody.innerHTML = rows.map(r => {
+      const mult = r.multiplier || 1;
+      const cls  = mult >= 2 ? 'up' : 'neu';
+      return `<tr>
+        <td>${r.trades.toLocaleString()}</td>
+        <td class="up">$${fmt(r.balance)}</td>
+        <td class="up">+$${fmt(r.profit)}</td>
+        <td class="${cls}">${mult}x</td>
+      </tr>`;
+    }).join('');
+  }
 }
 
 // ── UTILS ──────────────────────────────────────────────────

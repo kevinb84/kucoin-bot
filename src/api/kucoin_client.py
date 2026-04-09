@@ -9,14 +9,15 @@ load_dotenv()
 
 # KuCoin Futures ccxt unified symbol format
 SYMBOL_MAP = {
-    'XBTUSDTM':   'BTC/USDT:USDT',
-    'ETHUSDTM':   'ETH/USDT:USDT',
-    'SOLUSDTM':   'SOL/USDT:USDT',
-    'XRPUSDTM':   'XRP/USDT:USDT',
-    'DOGEUSDTM':  'DOGE/USDT:USDT',
-    'ADAUSDTM':   'ADA/USDT:USDT',
-    'MATICUSDTM': 'MATIC/USDT:USDT',
-    'DOTUSDTM':   'DOT/USDT:USDT',
+    'XBTUSDTM':    'BTC/USDT:USDT',
+    'ETHUSDTM':    'ETH/USDT:USDT',
+    'SOLUSDTM':    'SOL/USDT:USDT',
+    'XRPUSDTM':    'XRP/USDT:USDT',
+    'DOGEUSDTM':   'DOGE/USDT:USDT',
+    'ADAUSDTM':    'ADA/USDT:USDT',
+    'MATICUSDTM':  'MATIC/USDT:USDT',
+    'DOTUSDTM':    'DOT/USDT:USDT',
+    'SIRENUSDTM':  'SIREN/USDT:USDT',
 }
 
 def to_ccxt_symbol(symbol: str) -> str:
@@ -38,12 +39,26 @@ class KuCoinClient:
     def fetch_ohlcv(self, symbol, timeframe, limit=100):
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
+            print(f"[KuCoin] Fetching OHLCV: {symbol} -> {ccxt_symbol} | {timeframe} | limit={limit}")
             ohlcv = self.exchange.fetch_ohlcv(ccxt_symbol, timeframe, limit=limit)
+            if not ohlcv:
+                print(f"[KuCoin] Empty OHLCV response for {ccxt_symbol}")
+                return None
             df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            print(f"[KuCoin] Got {len(df)} candles for {ccxt_symbol}")
             return df
+        except ccxt.BadSymbol as e:
+            print(f"[KuCoin] Bad symbol '{symbol}' -> '{to_ccxt_symbol(symbol)}': {e}")
+            return None
+        except ccxt.NetworkError as e:
+            print(f"[KuCoin] Network error fetching {symbol}: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            print(f"[KuCoin] Exchange error fetching {symbol}: {e}")
+            return None
         except Exception as e:
-            print(f"[KuCoin] fetch_ohlcv error: {e}")
+            print(f"[KuCoin] fetch_ohlcv error for {symbol}: {type(e).__name__}: {e}")
             return None
 
     def fetch_ticker(self, symbol):

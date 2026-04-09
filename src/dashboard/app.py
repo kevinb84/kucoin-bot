@@ -1,6 +1,6 @@
 """
 KuCoin Trading Bot - Integrated Dashboard + Trading Engine
-One process: Dashboard shows charts AND bot actually trades.
+Supports multiple pairs: XBTUSDTM (BTC) + SIRENUSDTM (SIREN)
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -19,36 +19,58 @@ from src.api.kucoin_client import KuCoinClient
 from src.strategy.trend_following import TrendFollowingStrategy
 from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
+from src.learning.compounding_engine import CompoundingEngine
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Flask setup ──────────────────────────────────────────────
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'kucoin-bot-2026'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ── Load config ───────────────────────────────────────────────
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'config', 'config.yaml')
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'config', 'config.yaml'
+)
 with open(CONFIG_PATH, 'r') as f:
     CONFIG = yaml.safe_load(f)
 
-SYMBOL   = CONFIG.get('symbol', 'XBTUSDTM')
-TF       = CONFIG.get('timeframe', '5m')
-INTERVAL = CONFIG.get('check_interval', 10)
+PRIMARY_SYMBOL = CONFIG.get('symbol', 'XBTUSDTM')
+TF             = CONFIG.get('timeframe', '5m')
+INTERVAL       = CONFIG.get('check_interval', 10)
 
-# ── Shared state (dashboard reads this) ───────────────────────
+# Get all pairs from config
+multi_cfg = CONFIG.get('multi_pair_trading', {})
+ALL_PAIRS = multi_cfg.get('pairs', [PRIMARY_SYMBOL]) if multi_cfg.get('enabled', False) else [PRIMARY_SYMBOL]
+
+# Contract sizes per symbol (contracts per unit)
+# XBTUSDTM: 1 contract = 0.001 BTC
+# SIRENUSDTM: 1 contract = 10 SIREN
+CONTRACT_SIZE = {
+    'XBTUSDTM':  0.001,
+    'SIRENUSDTM': 10.0,
+    'ETHUSDTM':  0.01,
+    'SOLUSDTM':  1.0,
+    'XRPUSDTM':  10.0,
+}
+
+# ── Shared state ──────────────────────────────────────────────
 state = {
-    'is_running':      False,
-    'ticker':          {},
-    'candles':         [],
-    'position':        None,
-    'last_signal':     {'signal': 'none', 'strength': 0, 'reason': ''},
-    'performance':     {},
-    'recent_trades':   [],
-    'log_feed':        [],          # last 50 log lines shown in UI
-    'cycle':           0,
-    'last_update':     '',
+    'is_running':    False,
+    'ticker':        {},
+    'candles':       [],
+    'siren_candles': [],
+    'position':      None,
+    'last_signal':   {'signal': 'none', 'strength': 0, 'reason': ''},
+    'performance':   {},
+    'recent_trades': [],
+    'log_feed':      [],
+    'cycle':         0,
+    'last_update':   '',
+    'pairs':         ALL_PAIRS,
+    'active_pair':   PRIMARY_SYMBOL,
+    'compounding':   {},
 }
 
 # ── Components ────────────────────────────────────────────────
@@ -56,8 +78,12 @@ client   = KuCoinClient()
 journal  = TradeJournal(db_path=CONFIG.get('journal_db_path', 'trading_journal.db'))
 strategy = TrendFollowingStrategy(CONFIG)
 risk_mgr = AdvancedRiskManager(CONFIG)
+# Compounding engine - starts at current balance with 10% risk per trade
+compounder = CompoundingEngine(
+    starting_balance = 45.0,   # started at $50, now at $45 after losses
+    risk_pct         = 10.0,   # 10% risk per trade
+)
 
-# ── Thread handles ────────────────────────────────────────────
 bot_thread    = None
 market_thread = None
 
@@ -66,20 +92,16 @@ market_thread = None
 # ─────────────────────────────────────────────────────────────
 
 def push_log(msg: str):
-    """Append a message to the live log feed and broadcast."""
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     state['log_feed'].append(line)
-    if len(state['log_feed']) > 50:
-        state['log_feed'] = state['log_feed'][-50:]
+    if len(state['log_feed']) > 100:
+        state['log_feed'] = state['log_feed'][-100:]
     socketio.emit('log', {'line': line})
     logger.info(msg)
 
 
-def fetch_candles():
-    """Fetch OHLCV and return list-of-dicts for the UI."""
-    df = client.fetch_ohlcv(SYMBOL, TF, limit=100)
-    if df is None or df.empty:
-        return []
+def df_to_candles(df):
+    """Convert OHLCV dataframe to list of dicts for chart."""
     rows = []
     for _, r in df.iterrows():
         ts = r['timestamp']
@@ -98,26 +120,41 @@ def fetch_candles():
     return rows
 
 
+def get_contracts(symbol: str, margin_usd: float, leverage: int, price: float) -> int:
+    """Calculate number of contracts based on margin and contract size."""
+    contract_size = CONTRACT_SIZE.get(symbol, 0.001)
+    position_usd  = margin_usd * leverage
+    contracts     = position_usd / (price * contract_size)
+    return max(1, int(contracts))
+
+
 def update_performance():
-    stats = journal.get_trade_statistics(SYMBOL)
-    state['performance']   = stats
-    state['recent_trades'] = journal.get_recent_trades(SYMBOL, limit=20)
+    all_trades = []
+    for sym in ALL_PAIRS:
+        trades = journal.get_recent_trades(sym, limit=10)
+        all_trades.extend(trades)
+    all_trades.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    state['recent_trades'] = all_trades[:20]
+    # Performance from primary pair
+    state['performance'] = journal.get_trade_statistics(PRIMARY_SYMBOL)
+    state['compounding'] = compounder.get_stats()
 
 
 # ─────────────────────────────────────────────────────────────
-#  MARKET DATA THREAD  (always runs, updates chart every 5 s)
+#  MARKET DATA THREAD
 # ─────────────────────────────────────────────────────────────
 
 def market_loop():
+    """Always-running thread: fetches prices + charts for ALL pairs."""
+    logger.info(f"Market loop started for pairs: {ALL_PAIRS}")
     while True:
         try:
-            # candles
-            candles = fetch_candles()
-            if candles:
-                state['candles'] = candles
+            # ── BTC / primary pair ──
+            df_btc = client.fetch_ohlcv(PRIMARY_SYMBOL, TF, limit=100)
+            if df_btc is not None and not df_btc.empty:
+                state['candles'] = df_to_candles(df_btc)
 
-            # ticker
-            ticker = client.fetch_ticker(SYMBOL)
+            ticker = client.fetch_ticker(PRIMARY_SYMBOL)
             if ticker:
                 state['ticker'] = {
                     'price':  ticker.get('last', 0),
@@ -127,23 +164,38 @@ def market_loop():
                     'volume': ticker.get('baseVolume', 0),
                 }
 
-            # position
-            pos = client.fetch_position(SYMBOL)
-            if pos and pos.get('contracts', 0) != 0:
-                state['position'] = {
-                    'side':           'long' if float(pos.get('contracts', 0)) > 0 else 'short',
-                    'size':           pos.get('contracts', 0),
-                    'entry_price':    pos.get('entryPrice', 0),
-                    'mark_price':     pos.get('markPrice', 0),
-                    'unrealized_pnl': pos.get('unrealizedPnl', 0),
-                    'leverage':       pos.get('leverage', 10),
-                }
+            # ── SIREN (if in pairs) ──
+            if 'SIRENUSDTM' in ALL_PAIRS:
+                df_siren = client.fetch_ohlcv('SIRENUSDTM', TF, limit=100)
+                if df_siren is not None and not df_siren.empty:
+                    state['siren_candles'] = df_to_candles(df_siren)
+                    # Add SIREN ticker to state
+                    t_siren = client.fetch_ticker('SIRENUSDTM')
+                    if t_siren:
+                        state['siren_ticker'] = {
+                            'price':  t_siren.get('last', 0),
+                            'change': t_siren.get('percentage', 0),
+                        }
+
+            # ── Position ──
+            for sym in ALL_PAIRS:
+                pos = client.fetch_position(sym)
+                if pos and float(pos.get('contracts', 0) or 0) != 0:
+                    state['position'] = {
+                        'symbol':         sym,
+                        'side':           'long' if float(pos.get('contracts', 0)) > 0 else 'short',
+                        'size':           pos.get('contracts', 0),
+                        'entry_price':    pos.get('entryPrice', 0),
+                        'mark_price':     pos.get('markPrice', 0),
+                        'unrealized_pnl': pos.get('unrealizedPnl', 0),
+                        'leverage':       pos.get('leverage', 10),
+                    }
+                    break
             else:
                 state['position'] = None
 
             state['last_update'] = datetime.now().strftime('%H:%M:%S')
             update_performance()
-
             socketio.emit('state', state)
 
         except Exception as e:
@@ -153,185 +205,162 @@ def market_loop():
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRADING ENGINE THREAD  (runs only when bot is started)
+#  TRADING ENGINE THREAD
 # ─────────────────────────────────────────────────────────────
 
 def trading_loop():
-    """Core trading loop - generates signals and executes orders."""
-    push_log(f"🟢 Trading engine started | {SYMBOL} | {TF} | 10x leverage")
-    push_log(f"💰 Check interval: {INTERVAL}s | Min signal: {CONFIG.get('min_signal_strength',4)}/10")
+    """Scans ALL pairs every cycle for trade signals."""
+    push_log(f"Trading engine started | Pairs: {', '.join(ALL_PAIRS)}")
+    push_log(f"Interval: {INTERVAL}s | Min signal: {CONFIG.get('min_signal_strength',5)}/10")
+    push_log(f"Pairs loaded from config: {ALL_PAIRS}")
+    push_log(f"Multi-pair enabled: {CONFIG.get('multi_pair_trading', {}).get('enabled', False)}")
+    for p in ALL_PAIRS:
+        from src.api.kucoin_client import to_ccxt_symbol
+        push_log(f"  {p} -> {to_ccxt_symbol(p)} (ccxt symbol)")
 
     while state['is_running']:
         try:
             state['cycle'] += 1
             cycle = state['cycle']
 
-            # ── 1. Fetch data ──────────────────────────────────
-            df = client.fetch_ohlcv(SYMBOL, TF, limit=100)
-            if df is None or df.empty:
-                push_log("⚠️  No market data, retrying...")
-                time.sleep(INTERVAL)
-                continue
+            for symbol in ALL_PAIRS:
+                if not state['is_running']:
+                    break
+                try:
+                    df = client.fetch_ohlcv(symbol, TF, limit=100)
+                    if df is None or df.empty:
+                        push_log(f"[{symbol}] No data - check Railway logs for KuCoin error")
+                        time.sleep(5)
+                        continue
 
-            # ── 2. Analyse market ──────────────────────────────
-            signal = strategy.analyze(df)
-            sig    = signal.get('signal', 'hold')
-            str_   = signal.get('strength', 0)
-            reason = signal.get('reason', '')
+                    signal = strategy.analyze(df)
+                    sig    = signal.get('signal', 'hold')
+                    str_   = signal.get('strength', 0)
+                    reason = signal.get('reason', '')[:60]
 
-            state['last_signal'] = signal
-            push_log(f"📊 Cycle {cycle} | Signal: {sig.upper()} ({str_}/10) | {reason}")
+                    if symbol == ALL_PAIRS[0]:
+                        state['last_signal'] = signal
 
-            # ── 3. Check if already in position ───────────────
-            pos = client.fetch_position(SYMBOL)
-            in_position = pos and float(pos.get('contracts', 0)) != 0
+                    push_log(f"[{symbol}] #{cycle} {sig.upper()} ({str_}/10) | {reason}")
 
-            # ── 4. Monitor existing position ──────────────────
-            if in_position:
-                ticker = client.fetch_ticker(SYMBOL)
-                if ticker:
-                    price = float(ticker.get('last', 0))
-                    risk_mgr.update_position_tracking(price)
-                    risk_mgr.update_trailing_stop(price, risk_mgr.open_position['side'] if risk_mgr.open_position else 'buy')
+                    # Check existing position
+                    pos = client.fetch_position(symbol)
+                    in_pos = pos and float(pos.get('contracts', 0) or 0) != 0
 
-                    if risk_mgr.check_stop_loss_triggered(price):
-                        push_log(f"🛑 STOP LOSS hit @ {price:.2f}")
-                        _close_trade(price, 'stop_loss')
-                        in_position = False
+                    if in_pos and risk_mgr.open_position:
+                        ticker = client.fetch_ticker(symbol)
+                        if ticker:
+                            price = float(ticker.get('last', 0))
+                            risk_mgr.update_position_tracking(price)
+                            risk_mgr.update_trailing_stop(price, risk_mgr.open_position.get('side','buy'))
+                            if risk_mgr.check_stop_loss_triggered(price):
+                                push_log(f"[{symbol}] STOP LOSS @ {price:.5f}")
+                                _close_trade(price, 'stop_loss', symbol)
+                                in_pos = False
+                            elif risk_mgr.check_take_profit_triggered(price):
+                                push_log(f"[{symbol}] TAKE PROFIT @ {price:.5f}")
+                                _close_trade(price, 'take_profit', symbol)
+                                in_pos = False
 
-                    elif risk_mgr.check_take_profit_triggered(price):
-                        push_log(f"✅ TAKE PROFIT hit @ {price:.2f}")
-                        _close_trade(price, 'take_profit')
-                        in_position = False
+                    if not in_pos and sig in ('buy', 'sell'):
+                        min_str = CONFIG.get('min_signal_strength', 5)
+                        if str_ >= min_str:
+                            _execute_trade(sig, str_, symbol)
+                        else:
+                            push_log(f"[{symbol}] Weak signal ({str_}<{min_str}), skip")
 
-            # ── 5. Enter new trade ─────────────────────────────
-            if not in_position and sig in ('buy', 'sell'):
-                min_strength = CONFIG.get('min_signal_strength', 4)
-                if str_ >= min_strength:
-                    _execute_trade(sig, str_, df)
-                else:
-                    push_log(f"⏭️  Signal too weak ({str_} < {min_strength}), skip")
+                except Exception as e:
+                    push_log(f"[{symbol}] Error: {str(e)[:80]}")
+                    logger.error(f"[{symbol}] error: {e}", exc_info=True)
+
+                time.sleep(1)
 
         except Exception as e:
-            push_log(f"❌ Trading loop error: {e}")
-            logger.error(f"Trading loop error: {e}", exc_info=True)
-
+            push_log(f"Loop error: {str(e)[:80]}")
         time.sleep(INTERVAL)
 
-    push_log("🔴 Trading engine stopped")
+    push_log("Trading engine stopped")
 
 
-def _execute_trade(side: str, strength: int, df: pd.DataFrame):
-    """Execute a market order and record it."""
+def _execute_trade(side: str, strength: int, symbol: str):
+    """Execute market order for given symbol."""
     try:
-        ticker = client.fetch_ticker(SYMBOL)
+        ticker = client.fetch_ticker(symbol)
         if not ticker:
-            push_log("❌ Cannot fetch ticker")
+            push_log(f"[{symbol}] Cannot get ticker")
             return
-
         price = float(ticker.get('last', 0))
         if price <= 0:
-            push_log("❌ Invalid price from ticker")
+            push_log(f"[{symbol}] Bad price: {price}")
             return
 
-        # Balance check
         bal = client.fetch_balance()
         if not bal:
-            push_log("❌ Cannot fetch balance")
+            push_log(f"[{symbol}] Cannot get balance")
             return
-
         usdt = float(bal.get('USDT', {}).get('free', 0) or 0)
-        push_log(f"💳 Available balance: ${usdt:.2f} USDT")
-
-        if usdt < 5:
-            push_log(f"⚠️  Insufficient balance (${usdt:.2f} < $5 USDT) — add funds to KuCoin Futures account")
+        push_log(f"[{symbol}] Balance: ${usdt:.2f}")
+        if usdt < 3:
+            push_log(f"[{symbol}] Balance too low (${usdt:.2f})")
             return
 
-        # XBTUSDTM: 1 contract = 0.001 BTC
-        # With 10x leverage, $10 margin controls $100 worth = ~1 contract at $83,000
         leverage   = CONFIG.get('leverage', 10)
-        risk_pct   = CONFIG.get('risk_per_trade', 1.5) / 100
-        margin_usd = usdt * risk_pct                          # e.g. $50 * 1.5% = $0.75
-        margin_usd = max(margin_usd, 1.0)                    # minimum $1 margin
-        position_usd = margin_usd * leverage                 # e.g. $0.75 * 10 = $7.50
-        contracts  = max(1, int(position_usd / (price * 0.001)))  # 0.001 BTC per contract
+        # Use compounding engine for position sizing (grows with balance)
+        compounder.update_balance(usdt)
+        margin_usd = max(compounder.get_position_size_usd(), 1.0)
+        contracts  = get_contracts(symbol, margin_usd, leverage, price)
 
-        # SL / TP prices
-        sl_pct = CONFIG.get('stop_loss_percent', 0.3) / 100
-        tp_pct = CONFIG.get('take_profit_percent', 0.5) / 100
-        if side == 'buy':
-            sl = round(price * (1 - sl_pct), 2)
-            tp = round(price * (1 + tp_pct), 2)
-        else:
-            sl = round(price * (1 + sl_pct), 2)
-            tp = round(price * (1 - tp_pct), 2)
+        sl_pct = CONFIG.get('stop_loss_percent', 0.2) / 100
+        tp_pct = CONFIG.get('take_profit_percent', 0.6) / 100
+        sl = round(price * (1 - sl_pct if side=='buy' else 1 + sl_pct), 6)
+        tp = round(price * (1 + tp_pct if side=='buy' else 1 - tp_pct), 6)
 
-        push_log(f"🚀 {side.upper()} {contracts} contracts @ ${price:,.2f} | Margin:${margin_usd:.2f} | SL:{sl:,.2f} TP:{tp:,.2f}")
+        push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.5f} | SL:{sl:.5f} TP:{tp:.5f}")
 
-        order = client.create_order(
-            symbol=SYMBOL,
-            order_type='market',
-            side=side,
-            amount=contracts
-        )
-
+        order = client.create_order(symbol=symbol, order_type='market', side=side, amount=contracts)
         if order:
-            oid = order.get('id', 'N/A')
-            push_log(f"✅ Order filled! ID: {oid}")
-
+            push_log(f"[{symbol}] Order filled! ID:{order.get('id','?')}")
             risk_mgr.open_trade({
-                'symbol':          SYMBOL,
-                'side':            side,
-                'entry_price':     price,
-                'quantity':        contracts,
-                'leverage':        leverage,
-                'stop_loss':       sl,
-                'take_profit':     tp,
-                'signal_strength': strength,
+                'symbol': symbol, 'side': side, 'entry_price': price,
+                'quantity': contracts, 'leverage': leverage,
+                'stop_loss': sl, 'take_profit': tp, 'signal_strength': strength,
             })
         else:
-            push_log(f"❌ Order failed — check terminal window for exact error from KuCoin API")
-            push_log(f"   Hint: Ensure API key has FUTURES TRADING permission on KuCoin")
+            push_log(f"[{symbol}] Order failed - check terminal for KuCoin error")
 
     except Exception as e:
-        push_log(f"❌ Execute trade error: {e}")
+        push_log(f"[{symbol}] Trade error: {str(e)[:100]}")
         logger.error(f"Execute trade error: {e}", exc_info=True)
 
 
-def _close_trade(exit_price: float, reason: str):
-    """Close current position."""
+def _close_trade(exit_price: float, reason: str, symbol: str):
+    """Close open position for symbol."""
     try:
         if not risk_mgr.open_position:
             return
-
-        side  = risk_mgr.open_position['side']
-        qty   = abs(risk_mgr.open_position['quantity'])
+        side       = risk_mgr.open_position['side']
+        qty        = abs(risk_mgr.open_position['quantity'])
         close_side = 'sell' if side == 'buy' else 'buy'
-
-        order = client.create_order(
-            symbol=SYMBOL,
-            order_type='market',
-            side=close_side,
-            amount=qty,
-            params={'reduceOnly': True}   # ADD THIS
-        )
+        order = client.create_order(symbol=symbol, order_type='market',
+                                    side=close_side, amount=qty,
+                                    params={'reduceOnly': True})
         if order:
             result = risk_mgr.close_trade(exit_price, reason)
             if result:
                 journal.record_trade(result)
                 pnl = result.get('pnl', 0)
-                emoji = 'WIN' if pnl >= 0 else 'LOSS'
-                push_log(f"[{emoji}] Trade closed | {reason} | PnL: ${pnl:.4f}")
+                compounder.record_trade(pnl, side, symbol)
+                tag = 'WIN' if pnl >= 0 else 'LOSS'
+                push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
         else:
-            push_log("CLOSE FAILED - position may still be open!")
-
+            push_log(f"[{symbol}] CLOSE FAILED!")
     except Exception as e:
-        push_log(f"Close trade error: {e}")
+        push_log(f"[{symbol}] Close error: {str(e)[:100]}")
         logger.error(f"Close trade error: {e}", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────
-#  FLASK ROUTES
+#  FLASK ROUTES + WEBSOCKET
 # ─────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -344,16 +373,11 @@ def api_state():
 
 @app.route('/api/trades')
 def api_trades():
-    return jsonify(journal.get_recent_trades(SYMBOL, limit=50))
+    return jsonify(journal.get_recent_trades(PRIMARY_SYMBOL, limit=50))
 
 @app.route('/api/performance')
 def api_performance():
-    return jsonify(journal.get_trade_statistics(SYMBOL))
-
-
-# ─────────────────────────────────────────────────────────────
-#  WEBSOCKET EVENTS
-# ─────────────────────────────────────────────────────────────
+    return jsonify(journal.get_trade_statistics(PRIMARY_SYMBOL))
 
 @socketio.on('connect')
 def on_connect():
@@ -365,7 +389,7 @@ def on_connect():
 def on_start():
     global bot_thread
     if state['is_running']:
-        emit('log', {'line': '⚠️  Bot already running'})
+        emit('log', {'line': 'Bot already running'})
         return
     state['is_running'] = True
     bot_thread = threading.Thread(target=trading_loop, daemon=True)
@@ -375,7 +399,7 @@ def on_start():
 @socketio.on('stop_bot')
 def on_stop():
     state['is_running'] = False
-    push_log("🔴 Stop signal sent...")
+    push_log("Stop signal sent")
     emit('state', state)
 
 
@@ -385,23 +409,11 @@ def on_stop():
 
 def start():
     global market_thread
-    # Railway assigns PORT dynamically via env var
     port = int(os.environ.get('PORT', 5000))
-    
-    # Always run market data thread
     market_thread = threading.Thread(target=market_loop, daemon=True)
     market_thread.start()
-    
-    logger.info(f"Dashboard starting on port {port} -> http://localhost:{port}")
-    
-    # Use eventlet for production (required by Railway)
-    socketio.run(
-        app,
-        host='0.0.0.0',
-        port=port,
-        debug=False,
-        allow_unsafe_werkzeug=True
-    )
+    logger.info(f"Dashboard on port {port} | Pairs: {ALL_PAIRS}")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
 if __name__ == '__main__':
