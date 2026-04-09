@@ -1,0 +1,24 @@
+kucoin-trading-agent/
+├── config/
+│   └── config.yaml
+├── src/
+│   ├── __init__.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── kucoin_client.py
+│   ├── strategy/
+│   │   ├── __init__.py
+│   │   └── trend_following.py
+│   ├── risk/
+│   │   ├── __init__.py
+│   │   └── risk_manager.py
+│   ├── engine/
+│   │   ├── __init__.py
+│   │   └── trading_engine.py
+│   └── utils/
+│       ├── __init__.py
+│       └── logger.py
+├── requirements.txt
+├── .env.example
+├── main.py
+└── README.md

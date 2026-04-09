@@ -1,0 +1,74 @@
+# KuCoin Trading Agent - AGGRESSIVE SCALPING MODE
+
+# ===== KuCoin API Credentials =====
+# IMPORTANT: This connects to LIVE KuCoin API - use real credentials carefully
+api_key: "your_api_key_here"
+api_secret: "your_api_secret_here"
+api_passphrase: "your_api_passphrase_here"
+
+# ===== Trading Configuration - AGGRESSIVE SCALPING =====
+symbol: "XBTUSDTM"
+timeframe: "5m"
+check_interval: 10  # Check every 10 seconds (was 30s) - MORE FREQUENT
+leverage: 10
+
+# ===== Risk Management - Aggressive but Safe =====
+max_position_size: 15  # Keep $15 for safety
+risk_per_trade: 1.5  # Increase to 1.5% per trade
+stop_loss_percent: 0.3  # Tighter stop (0.3%)
+take_profit_percent: 0.5  # Quicker target (0.5%) - faster exits = more trades
+trailing_stop: true
+trailing_stop_distance: 0.15  # Tighter trailing (0.15%)
+max_daily_loss: 5.0  # Allow more room ($2.50 daily loss on $50)
+max_drawdown: 12.0  # More breathing room
+
+# ===== Strategy - AGGRESSIVE (More Trades) =====
+ema_fast: 7  # Faster EMA (was 9) - more sensitive
+ema_slow: 15  # Faster EMA (was 21) - more crossovers
+ema_signal_threshold: 0.2  # Lower threshold (was 0.4%) - more signals
+min_signal_strength: 4  # Much lower (was 7) - accept weaker signals
+rsi_period: 14
+rsi_overbought: 60  # Lower (was 65) - exit winners faster
+rsi_oversold: 40  # Higher (was 35) - enter dips sooner
+rsi_extreme_overbought: 75
+rsi_extreme_oversold: 25
+
+# ===== Safety Features - Relaxed for More Trades =====
+confirm_with_higher_tf: false  # DISABLE multi-timeframe confirmation (too restrictive)
+volume_threshold: 1.2  # Lower (was 1.5) - accept lower volume
+exit_on_opposite_signal: true
+max_hold_time_minutes: 20  # Shorter holds (was 45) - quick in/out
+
+# ===== Self-Learning =====
+learning_enabled: true
+optimization_interval: 20  # Optimize more often (was 30)
+min_trades_for_optimization: 10
+parameter_auto_tune: true
+performance_tracking: true
+
+# ===== Machine Learning - Lower Threshold =====
+ml_enabled: true
+ml_model_type: "random_forest"
+ml_feature_count: 10
+ml_retrain_interval: 20
+ml_confidence_threshold: 0.50  # Much lower (was 0.65) - 50% confidence OK
+
+# ===== Market Regime =====
+regime_detection: true
+volatility_lookback: 30
+trend_strength_threshold: 0.4  # Lower threshold
+
+# ===== Logging =====
+log_level: "INFO"
+log_file: "trading_bot.log"
+log_trades_to_file: true
+performance_report_interval: 900  # Report every 15 minutes
+
+# ===== Database =====
+journal_db_path: "trading_journal.db"
+
+# ===== Multi-Pair Trading =====
+multi_pair_trading:
+  enabled: false
+  pairs:
+    - "XBTUSDTM"

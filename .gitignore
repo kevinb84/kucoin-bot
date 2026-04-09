@@ -1,0 +1,42 @@
+# NEVER commit API keys
+.env
+*.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+env/
+.venv/
+
+# Database - trade history stays on server
+trading_journal.db
+*.db
+*.sqlite3
+
+# ML models
+*.pkl
+*.joblib
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+build/
+dist/
+*.egg-info/
