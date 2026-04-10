@@ -291,12 +291,23 @@ class AdvancedRiskManager:
         quantity = position['quantity']
         side = position['side']
         
-        # Calculate PnL
+        # Calculate PnL (account for contract size)
+        # XBTUSDTM: 1 contract = 0.001 BTC
+        # SIRENUSDTM: 1 contract = 10 SIREN
+        CONTRACT_SIZES = {
+            'XBTUSDTM': 0.001,
+            'SIRENUSDTM': 10.0,
+            'ETHUSDTM': 0.01,
+            'SOLUSDTM': 1.0,
+        }
+        symbol = position.get('symbol', 'XBTUSDTM')
+        contract_size = CONTRACT_SIZES.get(symbol, 0.001)
+        
         if side == 'buy':
-            pnl = (exit_price - entry_price) * quantity
+            pnl = (exit_price - entry_price) * quantity * contract_size
             pnl_percent = (exit_price / entry_price - 1) * 100
         else:  # sell
-            pnl = (entry_price - exit_price) * quantity
+            pnl = (entry_price - exit_price) * quantity * contract_size
             pnl_percent = (1 - exit_price / entry_price) * 100
         
         # Update daily PnL

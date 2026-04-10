@@ -1,5 +1,5 @@
-# KuCoin Trading Bot - Optimized for $3+ profit per trade
-# Balance: ~$45 | Leverage: 50x | Target: $3-5 per winning trade
+# KuCoin Trading Bot - Compounding Position Sizing
+# Balance: ~$45 | Leverage: 10x | Start: $20/trade, compound from wins
 
 # ===== API (set via Railway env vars) =====
 api_key: ""
@@ -7,19 +7,19 @@ api_secret: ""
 api_passphrase: ""
 
 # ===== Trading =====
-symbol: "XBTUSDTM"
+symbol: "SIRENUSDTM"
 timeframe: "5m"
 check_interval: 10
-leverage: 50
+leverage: 10
 
-# ===== Risk Management - Optimized for $3+ per trade =====
-# Math: $45 × 33% = $15 margin × 10x = $150 position × 2% TP = $3.00 profit
-max_position_size: 30        # $30 max margin per trade
-risk_per_trade: 30.0         # 30% of balance per trade ($45 × 30% = $13.50 margin = $675 position @ 50x)
-stop_loss_percent: 0.3       # 0.3% stop loss = $0.27 loss max (tighter)
-take_profit_percent: 1.5     # 1.5% take profit = $4.50-$10.00 profit per trade
+# ===== Risk Management - Compounding from wins =====
+# Math: $20 margin × 10x = $200 position × 2% TP = $4.00 profit per win
+max_position_size: 25        # $25 max margin per trade (hard cap)
+risk_per_trade: 20.0         # 20% of margin risk per trade
+stop_loss_percent: 0.5       # 0.5% stop loss
+take_profit_percent: 2.0     # 2.0% take profit
 trailing_stop: true
-trailing_stop_distance: 0.2  # Trail at 0.2%
+trailing_stop_distance: 0.3  # Trail at 0.3%
 max_daily_loss: 10.0         # Max 10% daily loss ($4.50)
 max_drawdown: 15.0           # Stop at 15% drawdown ($6.75)
 
@@ -44,7 +44,6 @@ max_hold_time_minutes: 60    # Give 2% target time to be reached
 multi_pair_trading:
   enabled: true
   pairs:
-    - "XBTUSDTM"
     - "SIRENUSDTM"
 
 # ===== Self-Learning =====

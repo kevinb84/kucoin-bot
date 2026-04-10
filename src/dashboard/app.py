@@ -20,6 +20,7 @@ from src.strategy.trend_following import TrendFollowingStrategy
 from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
 from src.learning.compounding_engine import CompoundingEngine
+from src.strategy.market_intelligence import MarketIntelligence
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -78,10 +79,13 @@ client   = KuCoinClient()
 journal  = TradeJournal(db_path=CONFIG.get('journal_db_path', 'trading_journal.db'))
 strategy = TrendFollowingStrategy(CONFIG)
 risk_mgr = AdvancedRiskManager(CONFIG)
-# Compounding engine - starts at current balance with 10% risk per trade
+risk_mgr.trade_history = []  # Fresh start
+risk_mgr.daily_pnl = 0.0
+intel = MarketIntelligence(client)
+# Compounding engine - $20 base trade, compound from wins
 compounder = CompoundingEngine(
-    starting_balance = 45.0,   # started at $50, now at $45 after losses
-    risk_pct         = 20.0,   # 20% risk per trade = $3-5 profit per winning trade
+    starting_balance = 45.0,
+    risk_pct         = 20.0,   # 20% compound growth per win
 )
 
 bot_thread    = None
@@ -138,6 +142,12 @@ def update_performance():
     # Performance from primary pair
     state['performance'] = journal.get_trade_statistics(PRIMARY_SYMBOL)
     state['compounding'] = compounder.get_stats()
+    # Add intelligence status
+    state['intelligence'] = {
+        'flash_crash_cooldown': intel.flash_crash_cooldown,
+        'funding_cache': {k: {'rate_pct': round(v.get('rate', 0) * 100, 4), 'direction': v.get('direction', 'neutral')} for k, v in intel.funding_cache.items()},
+        'orderbook': {k: {'bias': v.get('bias', 'neutral'), 'bid_pct': round(v.get('bid_pct', 0.5) * 100, 1)} for k, v in intel.last_orderbook.items()},
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -233,10 +243,26 @@ def trading_loop():
                         time.sleep(5)
                         continue
 
+                    # Get base signal from strategy
                     signal = strategy.analyze(df)
+                    
+                    # Apply Market Intelligence (order book, funding, correlation, flash crash)
+                    try:
+                        btc_df = None
+                        if symbol != 'XBTUSDTM':
+                            btc_df = client.fetch_ohlcv('XBTUSDTM', TF, limit=100)
+                        signal = intel.get_trade_intelligence(
+                            symbol=symbol,
+                            signal=signal,
+                            btc_df=btc_df,
+                            alt_df=df
+                        )
+                    except Exception as ie:
+                        push_log(f"[{symbol}] Intel error: {str(ie)[:50]}")
+                    
                     sig    = signal.get('signal', 'hold')
                     str_   = signal.get('strength', 0)
-                    reason = signal.get('reason', '')[:60]
+                    reason = signal.get('reason', '')[:120]
 
                     if symbol == ALL_PAIRS[0]:
                         state['last_signal'] = signal

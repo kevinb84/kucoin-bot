@@ -80,13 +80,29 @@ class CompoundingEngine:
 
     def get_position_size_usd(self) -> float:
         """
-        Calculate position margin in USDT based on current balance.
-        This is the core of compounding: bigger balance = bigger trades.
+        Compounding position sizing:
+        - Start at $20 per trade
+        - After each win, add 20% of profit to next trade
+        - Never exceed 50% of current balance
+        - Reset to $20 if we hit a losing streak (3+ losses in a row)
         """
-        margin = self.current_balance * (self.risk_pct / 100)
-        # Safety cap: never risk more than 20% in one trade
-        max_margin = self.current_balance * 0.20
-        return min(margin, max_margin)
+        base_margin = 20.0  # Start at $20
+
+        # Add compounding from winning trades
+        if self.winning_trades > 0 and self.total_profit > 0:
+            # Add 20% of accumulated profit to base margin
+            compound_bonus = self.total_profit * 0.20
+            margin = base_margin + compound_bonus
+        else:
+            margin = base_margin
+
+        # Safety caps
+        max_margin = self.current_balance * 0.50  # Never more than 50% of balance
+        hard_cap = 25.0  # Hard cap from config
+        margin = min(margin, max_margin, hard_cap)
+        margin = max(margin, 5.0)  # Minimum $5
+
+        return round(margin, 2)
 
     def get_risk_amount(self) -> float:
         """How much USDT we risk per trade (for stop loss sizing)."""

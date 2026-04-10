@@ -1,7 +1,17 @@
-[[services]]
+# Fly.io deployment config - EU region (Frankfurt)
+app = "kucoin-scalper-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
   internal_port = 5000
-  protocol = "tcp"
-  
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
