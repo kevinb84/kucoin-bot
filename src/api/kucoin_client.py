@@ -26,53 +26,62 @@ def to_ccxt_symbol(symbol: str) -> str:
 
 class KuCoinClient:
     def __init__(self):
+        api_key        = os.getenv('KUCOIN_API_KEY', '')
+        api_secret     = os.getenv('KUCOIN_API_SECRET', '')
+        api_passphrase = os.getenv('KUCOIN_API_PASSPHRASE', '')
+
+        # Authenticated exchange for trading
         self.exchange = ccxt.kucoinfutures({
-            'apiKey':   os.getenv('KUCOIN_API_KEY'),
-            'secret':   os.getenv('KUCOIN_API_SECRET'),
-            'password': os.getenv('KUCOIN_API_PASSPHRASE'),
+            'apiKey':          api_key,
+            'secret':          api_secret,
+            'password':        api_passphrase,
             'enableRateLimit': True,
         })
-        self._margin_mode = None  # cached margin mode
 
-    # ── MARKET DATA ───────────────────────────────────────────
+        # Public exchange for market data (no API keys needed)
+        # This works even without credentials - avoids auth errors on Railway
+        self.public = ccxt.kucoinfutures({
+            'enableRateLimit': True,
+        })
+
+        self._margin_mode = None
+        print(f"[KuCoin] Client initialized | API key set: {bool(api_key)}")
+
+    # ── MARKET DATA (uses public endpoint) ───────────────────
 
     def fetch_ohlcv(self, symbol, timeframe, limit=100):
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
-            print(f"[KuCoin] Fetching OHLCV: {symbol} -> {ccxt_symbol} | {timeframe} | limit={limit}")
-            ohlcv = self.exchange.fetch_ohlcv(ccxt_symbol, timeframe, limit=limit)
+            print(f"[KuCoin] OHLCV {ccxt_symbol} {timeframe} ...")
+            ohlcv = self.public.fetch_ohlcv(ccxt_symbol, timeframe, limit=limit)
             if not ohlcv:
-                print(f"[KuCoin] Empty OHLCV response for {ccxt_symbol}")
+                print(f"[KuCoin] Empty response for {ccxt_symbol}")
                 return None
             df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             print(f"[KuCoin] Got {len(df)} candles for {ccxt_symbol}")
             return df
         except ccxt.BadSymbol as e:
-            print(f"[KuCoin] Bad symbol '{symbol}' -> '{to_ccxt_symbol(symbol)}': {e}")
+            print(f"[KuCoin] Bad symbol {ccxt_symbol}: {e}")
             return None
         except ccxt.NetworkError as e:
-            print(f"[KuCoin] Network error fetching {symbol}: {e}")
-            return None
-        except ccxt.ExchangeError as e:
-            print(f"[KuCoin] Exchange error fetching {symbol}: {e}")
+            print(f"[KuCoin] Network error {ccxt_symbol}: {e}")
             return None
         except Exception as e:
-            print(f"[KuCoin] fetch_ohlcv error for {symbol}: {type(e).__name__}: {e}")
+            print(f"[KuCoin] fetch_ohlcv {ccxt_symbol}: {type(e).__name__}: {e}")
             return None
 
     def fetch_ticker(self, symbol):
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
-            return self.exchange.fetch_ticker(ccxt_symbol)
+            return self.public.fetch_ticker(ccxt_symbol)
         except Exception as e:
-            print(f"[KuCoin] fetch_ticker error: {e}")
+            print(f"[KuCoin] fetch_ticker {symbol}: {e}")
             return None
 
-    # ── ACCOUNT ───────────────────────────────────────────────
+    # ── ACCOUNT (uses authenticated endpoint) ────────────────
 
     def get_margin_mode(self, symbol) -> str:
-        """Fetch the actual margin mode set on the account for this symbol."""
         try:
             if self._margin_mode:
                 return self._margin_mode
@@ -80,16 +89,16 @@ class KuCoinClient:
             result = self.exchange.fetch_margin_mode(ccxt_symbol)
             mode = result.get('marginMode', 'isolated').lower()
             self._margin_mode = mode
-            print(f"[KuCoin] Account margin mode: {mode}")
+            print(f"[KuCoin] Margin mode: {mode}")
             return mode
         except Exception as e:
-            print(f"[KuCoin] Could not fetch margin mode: {e} — defaulting to isolated")
+            print(f"[KuCoin] get_margin_mode error: {e} - defaulting to isolated")
             self._margin_mode = 'isolated'
             return 'isolated'
 
     def fetch_balance(self):
         try:
-            raw = self.exchange.fetch_balance()
+            raw        = self.exchange.fetch_balance()
             usdt_free  = 0.0
             usdt_total = 0.0
 
@@ -104,23 +113,21 @@ class KuCoinClient:
                     usdt_free = float(avail)
 
             return {'USDT': {'free': usdt_free, 'total': max(usdt_total, usdt_free)}}
-
         except Exception as e:
-            print(f"[KuCoin] fetch_balance error: {e}")
+            print(f"[KuCoin] fetch_balance: {e}")
             traceback.print_exc()
             return None
 
     def fetch_position(self, symbol):
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
-            positions = self.exchange.fetch_positions([ccxt_symbol])
+            positions   = self.exchange.fetch_positions([ccxt_symbol])
             for p in positions:
-                contracts = float(p.get('contracts', 0) or 0)
-                if contracts != 0:
+                if float(p.get('contracts', 0) or 0) != 0:
                     return p
             return None
         except Exception as e:
-            print(f"[KuCoin] fetch_position error: {e}")
+            print(f"[KuCoin] fetch_position {symbol}: {e}")
             return None
 
     def set_leverage(self, symbol, leverage):
@@ -134,22 +141,17 @@ class KuCoinClient:
     # ── ORDERS ────────────────────────────────────────────────
 
     def create_order(self, symbol, order_type, side, amount, price=None, params=None):
-        """
-        Place a futures market order on KuCoin.
-        Auto-detects margin mode from account settings.
-        """
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
-            amount = max(1, int(amount))
-            leverage = int(os.getenv('LEVERAGE', 10))
+            amount      = max(1, int(amount))
+            leverage    = int(os.getenv('LEVERAGE', 10))
 
-            # Detect account margin mode
             margin_mode = self.get_margin_mode(symbol)
 
             extra = {
                 'leverage':   leverage,
                 'hedged':     True,
-                'marginMode': margin_mode,   # match account setting exactly
+                'marginMode': margin_mode,
             }
 
             if params and params.get('reduceOnly'):
@@ -160,15 +162,11 @@ class KuCoinClient:
                     if k not in ('hedged', 'marginMode'):
                         extra[k] = v
 
-            print(f"[KuCoin] {order_type.upper()} {side.upper()} {amount}x {ccxt_symbol} | margin={margin_mode} hedged=True lev={leverage}")
+            print(f"[KuCoin] ORDER {order_type.upper()} {side.upper()} {amount}x {ccxt_symbol} margin={margin_mode} lev={leverage}")
 
             order = self.exchange.create_order(
-                symbol = ccxt_symbol,
-                type   = order_type,
-                side   = side,
-                amount = amount,
-                price  = price,
-                params = extra,
+                symbol=ccxt_symbol, type=order_type,
+                side=side, amount=amount, price=price, params=extra,
             )
             print(f"[KuCoin] Order OK: id={order.get('id')} status={order.get('status')}")
             return order
@@ -176,7 +174,6 @@ class KuCoinClient:
         except ccxt.InvalidOrder as e:
             err = str(e)
             print(f"[KuCoin] Invalid order: {err}")
-            # If margin mode mismatch, flip and retry once
             if '330005' in err:
                 return self._retry_opposite_margin(symbol, order_type, side, amount, price, params)
         except ccxt.InsufficientFunds as e:
@@ -191,55 +188,37 @@ class KuCoinClient:
         return None
 
     def _retry_opposite_margin(self, symbol, order_type, side, amount, price, params):
-        """Retry order with opposite margin mode if 330005 error."""
         try:
             ccxt_symbol = to_ccxt_symbol(symbol)
-            amount  = max(1, int(amount))
-            leverage = int(os.getenv('LEVERAGE', 10))
-
-            # Flip margin mode
-            current = self._margin_mode or 'isolated'
-            flipped = 'cross' if current == 'isolated' else 'isolated'
-            self._margin_mode = flipped  # update cache
-
-            print(f"[KuCoin] Retrying with marginMode={flipped} ...")
-
-            extra = {
-                'leverage':   leverage,
-                'hedged':     True,
-                'marginMode': flipped,
-            }
+            amount      = max(1, int(amount))
+            leverage    = int(os.getenv('LEVERAGE', 10))
+            current     = self._margin_mode or 'isolated'
+            flipped     = 'cross' if current == 'isolated' else 'isolated'
+            self._margin_mode = flipped
+            print(f"[KuCoin] Retrying with marginMode={flipped}")
+            extra = {'leverage': leverage, 'hedged': True, 'marginMode': flipped}
             if params and params.get('reduceOnly'):
                 extra['reduceOnly'] = True
-
             order = self.exchange.create_order(
-                symbol = ccxt_symbol,
-                type   = order_type,
-                side   = side,
-                amount = amount,
-                price  = price,
-                params = extra,
+                symbol=ccxt_symbol, type=order_type,
+                side=side, amount=amount, price=price, params=extra,
             )
-            print(f"[KuCoin] Retry OK: id={order.get('id')} status={order.get('status')}")
+            print(f"[KuCoin] Retry OK: id={order.get('id')}")
             return order
-
         except Exception as e:
-            print(f"[KuCoin] Retry also failed: {e}")
-            traceback.print_exc()
+            print(f"[KuCoin] Retry failed: {e}")
             return None
 
     def cancel_order(self, order_id, symbol):
         try:
-            ccxt_symbol = to_ccxt_symbol(symbol)
-            return self.exchange.cancel_order(order_id, ccxt_symbol)
+            return self.exchange.cancel_order(order_id, to_ccxt_symbol(symbol))
         except Exception as e:
-            print(f"[KuCoin] cancel_order error: {e}")
+            print(f"[KuCoin] cancel_order: {e}")
             return None
 
     def fetch_open_orders(self, symbol):
         try:
-            ccxt_symbol = to_ccxt_symbol(symbol)
-            return self.exchange.fetch_open_orders(ccxt_symbol)
+            return self.exchange.fetch_open_orders(to_ccxt_symbol(symbol))
         except Exception as e:
-            print(f"[KuCoin] fetch_open_orders error: {e}")
+            print(f"[KuCoin] fetch_open_orders: {e}")
             return None
