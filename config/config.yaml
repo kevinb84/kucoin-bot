@@ -1,6 +1,6 @@
-# KuCoin Micro-Scalping Bot - $0.40 per trade, 1 trade per minute
+# KuCoin Micro-Scalping Bot - $0.80 per trade, 1 trade per minute
 # Balance: ~$45 | Leverage: 10x | $20 margin = $200 position
-# Math: $200 position × 0.2% move = $0.40 profit per trade
+# Math: $200 position × 0.4% move = $0.80 profit per trade
 
 # ===== API (set via Railway env vars) =====
 api_key: ""
@@ -15,12 +15,12 @@ leverage: 10
 
 # ===== Risk Management - Micro Scalp =====
 # $20 margin × 10x = $200 position
-# TP: 0.2% of $200 = $0.40 profit per win
-# SL: 0.15% of $200 = $0.30 loss per loss
+# TP: 0.4% of $200 = $0.80 profit per win
+# SL: 0.35% of $200 = $0.70 max loss (wider than noise on 1-min SIREN)
 max_position_size: 25        # $25 max margin
 risk_per_trade: 20.0
-stop_loss_percent: 0.15      # 0.15% tight stop = $0.30 max loss
-take_profit_percent: 0.2     # 0.2% quick TP = $0.40 profit
+stop_loss_percent: 0.35      # 0.35% stop = $0.70 max loss (avoids wick noise)
+take_profit_percent: 0.4     # 0.4% TP = $0.80 profit per win
 trailing_stop: false         # No trailing for micro scalps (too tight)
 trailing_stop_distance: 0.1
 max_daily_loss: 10.0
