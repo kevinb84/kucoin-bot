@@ -19,7 +19,7 @@ class CompoundingEngine:
     # Milestones to celebrate and log
     MILESTONES = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
 
-    def __init__(self, starting_balance: float = 45.0, risk_pct: float = 10.0):
+    def __init__(self, starting_balance: float = 45.0, risk_pct: float = 20.0):
         """
         Args:
             starting_balance: Starting capital in USDT

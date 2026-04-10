@@ -81,7 +81,7 @@ risk_mgr = AdvancedRiskManager(CONFIG)
 # Compounding engine - starts at current balance with 10% risk per trade
 compounder = CompoundingEngine(
     starting_balance = 45.0,   # started at $50, now at $45 after losses
-    risk_pct         = 10.0,   # 10% risk per trade
+    risk_pct         = 20.0,   # 20% risk per trade = $3-5 profit per winning trade
 )
 
 bot_thread    = None

@@ -2,10 +2,7 @@ import ccxt
 import os
 import time
 import traceback
-from dotenv import load_dotenv
 import pandas as pd
-
-load_dotenv()
 
 # KuCoin Futures ccxt unified symbol format
 SYMBOL_MAP = {
@@ -26,9 +23,12 @@ def to_ccxt_symbol(symbol: str) -> str:
 
 class KuCoinClient:
     def __init__(self):
-        api_key        = os.getenv('KUCOIN_API_KEY', '')
-        api_secret     = os.getenv('KUCOIN_API_SECRET', '')
-        api_passphrase = os.getenv('KUCOIN_API_PASSPHRASE', '')
+        api_key        = os.environ.get('KUCOIN_API_KEY', '')
+        api_secret     = os.environ.get('KUCOIN_API_SECRET', '')
+        api_passphrase = os.environ.get('KUCOIN_API_PASSPHRASE', '')
+
+        # Debug: Print env var status
+        print(f"[KuCoin] Env check - KEY: {'SET' if api_key else 'MISSING'}, SECRET: {'SET' if api_secret else 'MISSING'}, PASSPHRASE: {'SET' if api_passphrase else 'MISSING'}")
 
         # Authenticated exchange for trading
         self.exchange = ccxt.kucoinfutures({
