@@ -32,6 +32,10 @@ class MarketIntelligence:
         self.funding_cache = {}     # symbol -> {rate, next_time}
         self.last_orderbook = {}    # symbol -> orderbook data
         self.flash_crash_cooldown = 0  # Seconds until we trade again after crash
+        self.consecutive_losses = 0
+        self.total_session_losses = 0
+        self.last_trade_result = None
+        self.loss_cooldown_until = 0  # timestamp when loss cooldown ends
         
     # ── ORDER BOOK ANALYSIS ───────────────────────────────────
     
@@ -311,6 +315,195 @@ class MarketIntelligence:
             print(f"[Intelligence] Flash crash detection error: {e}")
             return {'detected': False, 'severity': 'none', 'drop_pct': 0}
     
+    # ── TIME-OF-DAY / SESSION AWARENESS ───────────────────────
+    
+    def get_session_info(self) -> Dict:
+        """
+        Detect current trading session and adjust behavior.
+        - Asian session (00:00-08:00 UTC): Low volume, tight ranges, less reliable signals
+        - EU session (08:00-16:00 UTC): Higher volume, good trends
+        - US session (13:00-21:00 UTC): Highest volume, biggest moves
+        - EU/US overlap (13:00-16:00 UTC): Best liquidity, strongest signals
+        - Dead zone (21:00-00:00 UTC): Low volume, avoid trading
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        hour = now.hour
+        
+        if 0 <= hour < 8:
+            session = 'asian'
+            quality = 'low'
+            strength_mod = -1
+            reason = f'Asian session ({hour}:00 UTC) - low volume, weaker signals'
+        elif 13 <= hour < 16:
+            session = 'eu_us_overlap'
+            quality = 'high'
+            strength_mod = 2
+            reason = f'EU/US overlap ({hour}:00 UTC) - best liquidity'
+        elif 8 <= hour < 13:
+            session = 'european'
+            quality = 'medium'
+            strength_mod = 1
+            reason = f'EU session ({hour}:00 UTC) - good trends'
+        elif 16 <= hour < 21:
+            session = 'us'
+            quality = 'medium'
+            strength_mod = 1
+            reason = f'US session ({hour}:00 UTC) - high volume'
+        else:
+            session = 'dead_zone'
+            quality = 'low'
+            strength_mod = -2
+            reason = f'Dead zone ({hour}:00 UTC) - avoid trading'
+        
+        return {
+            'session': session,
+            'quality': quality,
+            'strength_mod': strength_mod,
+            'hour_utc': hour,
+            'reason': reason
+        }
+    
+    # ── CONSECUTIVE LOSS LIMITER ──────────────────────────────
+    
+    def __init_loss_tracker(self):
+        """Initialize loss tracking if not already done."""
+        if not hasattr(self, 'consecutive_losses'):
+            self.consecutive_losses = 0
+            self.total_session_losses = 0
+            self.last_trade_result = None
+    
+    def record_trade_result(self, won: bool):
+        """
+        Track consecutive wins/losses.
+        Call this after each trade closes.
+        """
+        self.__init_loss_tracker()
+        if won:
+            self.consecutive_losses = 0
+            self.last_trade_result = 'win'
+        else:
+            self.consecutive_losses += 1
+            self.total_session_losses += 1
+            self.last_trade_result = 'loss'
+    
+    def check_loss_limit(self) -> Dict:
+        """
+        Check if we should reduce/stop trading due to consecutive losses.
+        - 2 losses: Reduce position size by 50%
+        - 3 losses: Skip next signal (wait for confirmation)
+        - 5 losses: Stop trading for 30 minutes
+        """
+        self.__init_loss_tracker()
+        
+        if self.consecutive_losses >= 5:
+            return {
+                'action': 'stop',
+                'reason': f'{self.consecutive_losses} consecutive losses - pausing 30min',
+                'position_multiplier': 0.0,
+                'skip_next': True,
+                'cooldown_minutes': 30
+            }
+        elif self.consecutive_losses >= 3:
+            return {
+                'action': 'skip',
+                'reason': f'{self.consecutive_losses} consecutive losses - waiting for strong signal',
+                'position_multiplier': 0.25,
+                'skip_next': True,
+                'cooldown_minutes': 0
+            }
+        elif self.consecutive_losses >= 2:
+            return {
+                'action': 'reduce',
+                'reason': f'{self.consecutive_losses} consecutive losses - reducing size 50%',
+                'position_multiplier': 0.5,
+                'skip_next': False,
+                'cooldown_minutes': 0
+            }
+        else:
+            return {
+                'action': 'normal',
+                'reason': 'No loss streak',
+                'position_multiplier': 1.0,
+                'skip_next': False,
+                'cooldown_minutes': 0
+            }
+    
+    # ── SLIPPAGE ESTIMATION ───────────────────────────────────
+    
+    def estimate_slippage(self, symbol: str, side: str, size_usd: float) -> Dict:
+        """
+        Estimate slippage for SIREN (low liquidity token).
+        Uses order book depth to predict execution price vs mid price.
+        
+        Args:
+            symbol: Trading symbol
+            side: 'buy' or 'sell'
+            size_usd: Position size in USD
+        
+        Returns: {'slippage_pct': float, 'safe': bool, 'reason': str}
+        """
+        try:
+            from src.api.kucoin_client import to_ccxt_symbol
+            ccxt_symbol = to_ccxt_symbol(symbol)
+            orderbook = self.client.public.fetch_order_book(ccxt_symbol, limit=50)
+            
+            if not orderbook:
+                return {'slippage_pct': 0.1, 'safe': True, 'reason': 'No OB data, default estimate'}
+            
+            bids = orderbook.get('bids', [])
+            asks = orderbook.get('asks', [])
+            
+            if not bids or not asks:
+                return {'slippage_pct': 0.1, 'safe': True, 'reason': 'Empty OB'}
+            
+            mid_price = (bids[0][0] + asks[0][0]) / 2
+            
+            # Walk through order book to fill our order size
+            book = asks if side == 'buy' else bids
+            remaining_usd = size_usd
+            filled_cost = 0.0
+            filled_qty = 0.0
+            
+            for price, qty in book:
+                level_usd = price * qty
+                if remaining_usd <= level_usd:
+                    # Partial fill at this level
+                    fill_qty = remaining_usd / price
+                    filled_cost += fill_qty * price
+                    filled_qty += fill_qty
+                    remaining_usd = 0
+                    break
+                else:
+                    filled_cost += qty * price
+                    filled_qty += qty
+                    remaining_usd -= level_usd
+            
+            if filled_qty > 0 and remaining_usd == 0:
+                avg_fill_price = filled_cost / filled_qty
+                slippage_pct = abs(avg_fill_price - mid_price) / mid_price * 100
+            else:
+                # Not enough liquidity to fill
+                slippage_pct = 0.5  # Assume worst case
+            
+            # Safety check
+            safe = slippage_pct < 0.3  # Less than 0.3% slippage is acceptable
+            
+            reason = f"Est. slippage: {slippage_pct:.3f}%"
+            if not safe:
+                reason += f" - DANGEROUS for ${size_usd:.0f} order"
+            
+            return {
+                'slippage_pct': round(slippage_pct, 4),
+                'safe': safe,
+                'mid_price': mid_price,
+                'reason': reason
+            }
+            
+        except Exception as e:
+            print(f"[Intelligence] Slippage estimation error: {e}")
+            return {'slippage_pct': 0.1, 'safe': True, 'reason': f'Error: {str(e)[:50]}'}
+    
     def is_safe_to_trade(self) -> Tuple[bool, str]:
         """
         Check if it's safe to trade right now.
@@ -331,27 +524,47 @@ class MarketIntelligence:
         """
         Get combined intelligence score for a trade signal.
         Adjusts signal strength based on all smart factors.
-        
-        Args:
-            symbol: Trading symbol (e.g., 'XBTUSDTM')
-            signal: Original signal dict from strategy
-            btc_df: BTC OHLCV dataframe (for correlation)
-            alt_df: Alt OHLCV dataframe (for correlation)
-        
-        Returns:
-            Modified signal dict with intelligence adjustments
         """
         adjustments = []
         strength_mod = 0
         
-        # 1. Safety check
+        # 1. Safety check (flash crash cooldown)
         safe, safe_reason = self.is_safe_to_trade()
         if not safe:
             signal['signal'] = 'hold'
             signal['reason'] += f' | BLOCKED: {safe_reason}'
             return signal
         
-        # 2. Flash crash check on current data
+        # 2. Consecutive loss check
+        loss_check = self.check_loss_limit()
+        if loss_check['action'] == 'stop':
+            signal['signal'] = 'hold'
+            signal['reason'] += f" | BLOCKED: {loss_check['reason']}"
+            return signal
+        elif loss_check['action'] == 'skip':
+            # Only allow very strong signals (8+)
+            if signal['strength'] < 8:
+                signal['signal'] = 'hold'
+                signal['reason'] += f" | BLOCKED: {loss_check['reason']} (need 8+ strength)"
+                return signal
+            adjustments.append(f"Loss streak ({self.consecutive_losses}), reduced size")
+        elif loss_check['action'] == 'reduce':
+            adjustments.append(f"2 losses, half size")
+        
+        # 3. Session awareness
+        session = self.get_session_info()
+        strength_mod += session['strength_mod']
+        if session['quality'] == 'low':
+            adjustments.append(f"{session['session']} session")
+            # In dead zone, require stronger signals
+            if session['session'] == 'dead_zone' and signal['strength'] < 7:
+                signal['signal'] = 'hold'
+                signal['reason'] += f" | BLOCKED: Dead zone, weak signal"
+                return signal
+        elif session['quality'] == 'high':
+            adjustments.append(f"{session['session']} (best time)")
+        
+        # 4. Flash crash check on current data
         if alt_df is not None:
             crash = self.detect_flash_crash(alt_df)
             if crash['detected']:
@@ -366,7 +579,7 @@ class MarketIntelligence:
                     strength_mod -= 1
                     adjustments.append(f"Elevated volatility")
         
-        # 3. Order book analysis
+        # 5. Order book analysis
         ob = self.analyze_orderbook(symbol)
         if ob['bias'] != 'neutral':
             if (signal['signal'] == 'buy' and ob['bias'] == 'bullish') or \
@@ -378,24 +591,31 @@ class MarketIntelligence:
                 strength_mod -= ob['strength']
                 adjustments.append(f"OB opposes ({ob['bias']})")
         
-        # 4. Funding rate check
+        # 6. Slippage check (critical for SIREN)
+        if signal['signal'] in ('buy', 'sell'):
+            slippage = self.estimate_slippage(symbol, signal['signal'], 20.0)
+            if not slippage['safe']:
+                strength_mod -= 2
+                adjustments.append(f"High slippage ({slippage['slippage_pct']:.2f}%)")
+        
+        # 7. Funding rate check
         funding = self.check_funding_rate(symbol)
         if funding['expensive']:
             if (signal['signal'] == 'buy' and funding['direction'] == 'bearish') or \
                (signal['signal'] == 'sell' and funding['direction'] == 'bullish'):
                 strength_mod -= 2
-                adjustments.append(f"Funding costly ({funding['rate_pct']:.3f}%)")
+                adjustments.append(f"Funding costly ({funding.get('rate_pct', 0):.3f}%)")
             else:
                 strength_mod += 1
                 adjustments.append(f"Funding favors trade")
         
-        # 5. BTC correlation (only for altcoins)
+        # 8. BTC correlation (for altcoins)
         if 'SIREN' in symbol and btc_df is not None and alt_df is not None:
             corr = self.check_btc_correlation(btc_df, alt_df)
             if corr['correlation'] > 0.5:
                 if signal['signal'] == 'buy' and corr['btc_trend'] == 'bearish':
                     strength_mod -= 2
-                    adjustments.append(f"BTC bearish, high corr ({corr['correlation']:.2f})")
+                    adjustments.append(f"BTC bearish, corr {corr['correlation']:.2f}")
                 elif signal['signal'] == 'buy' and corr['btc_trend'] == 'bullish':
                     strength_mod += 1
                     adjustments.append(f"BTC bullish, confirms")
@@ -417,7 +637,10 @@ class MarketIntelligence:
             'adjustments': adjustments,
             'strength_mod': strength_mod,
             'original_strength': original_strength,
-            'final_strength': signal['strength']
+            'final_strength': signal['strength'],
+            'session': session['session'],
+            'consecutive_losses': self.consecutive_losses,
+            'position_multiplier': loss_check['position_multiplier']
         }
         
         return signal

@@ -334,6 +334,13 @@ def _execute_trade(side: str, strength: int, symbol: str):
         # Use compounding engine for position sizing (grows with balance)
         compounder.update_balance(usdt)
         margin_usd = max(compounder.get_position_size_usd(), 1.0)
+        
+        # Apply loss limiter multiplier (reduces size after consecutive losses)
+        loss_check = intel.check_loss_limit()
+        if loss_check['position_multiplier'] < 1.0:
+            margin_usd = margin_usd * loss_check['position_multiplier']
+            push_log(f"[{symbol}] Position reduced: {loss_check['reason']}")
+        
         contracts  = get_contracts(symbol, margin_usd, leverage, price)
 
         sl_pct = CONFIG.get('stop_loss_percent', 0.2) / 100
@@ -376,6 +383,7 @@ def _close_trade(exit_price: float, reason: str, symbol: str):
                 journal.record_trade(result)
                 pnl = result.get('pnl', 0)
                 compounder.record_trade(pnl, side, symbol)
+                intel.record_trade_result(won=(pnl >= 0))
                 tag = 'WIN' if pnl >= 0 else 'LOSS'
                 push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
         else:
