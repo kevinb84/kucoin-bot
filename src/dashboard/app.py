@@ -72,6 +72,7 @@ state = {
     'pairs':         ALL_PAIRS,
     'active_pair':   PRIMARY_SYMBOL,
     'compounding':   {},
+    'trade_open_time': None,
 }
 
 # ── Components ────────────────────────────────────────────────
@@ -287,6 +288,15 @@ def trading_loop():
                                 push_log(f"[{symbol}] TAKE PROFIT @ {price:.5f}")
                                 _close_trade(price, 'take_profit', symbol)
                                 in_pos = False
+                            # Auto-exit after max hold time (micro-scalp: 3 min)
+                            elif state.get('trade_open_time'):
+                                hold_secs = time.time() - state['trade_open_time']
+                                max_hold = CONFIG.get('max_hold_time_minutes', 3) * 60
+                                if hold_secs >= max_hold:
+                                    push_log(f"[{symbol}] MAX HOLD TIME ({hold_secs:.0f}s) - auto closing")
+                                    _close_trade(price, 'max_hold_time', symbol)
+                                    in_pos = False
+                                    state['trade_open_time'] = None
 
                     if not in_pos and sig in ('buy', 'sell'):
                         min_str = CONFIG.get('min_signal_strength', 5)
@@ -358,6 +368,7 @@ def _execute_trade(side: str, strength: int, symbol: str):
                 'quantity': contracts, 'leverage': leverage,
                 'stop_loss': sl, 'take_profit': tp, 'signal_strength': strength,
             })
+            state['trade_open_time'] = time.time()
         else:
             push_log(f"[{symbol}] Order failed - check terminal for KuCoin error")
 
@@ -385,6 +396,7 @@ def _close_trade(exit_price: float, reason: str, symbol: str):
                 compounder.record_trade(pnl, side, symbol)
                 intel.record_trade_result(won=(pnl >= 0))
                 tag = 'WIN' if pnl >= 0 else 'LOSS'
+                state['trade_open_time'] = None
                 push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
         else:
             push_log(f"[{symbol}] CLOSE FAILED!")
