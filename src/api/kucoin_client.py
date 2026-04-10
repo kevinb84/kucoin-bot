@@ -3,6 +3,9 @@ import os
 import time
 import traceback
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # KuCoin Futures ccxt unified symbol format
 SYMBOL_MAP = {
@@ -29,6 +32,22 @@ class KuCoinClient:
 
         # Debug: Print env var status
         print(f"[KuCoin] Env check - KEY: {'SET' if api_key else 'MISSING'}, SECRET: {'SET' if api_secret else 'MISSING'}, PASSPHRASE: {'SET' if api_passphrase else 'MISSING'}")
+
+        # Force IPv4 by setting socket default
+        # This makes Python prefer IPv4 over IPv6
+        import socket
+        # Monkey patch getaddrinfo to prefer IPv4
+        original_getaddrinfo = socket.getaddrinfo
+        
+        def getaddrinfo_prefer_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+            # Try IPv4 first (AF_INET = 2)
+            try:
+                return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+            except socket.gaierror:
+                # Fall back to original behavior
+                return original_getaddrinfo(host, port, family, type, proto, flags)
+        
+        socket.getaddrinfo = getaddrinfo_prefer_ipv4
 
         # Authenticated exchange for trading
         self.exchange = ccxt.kucoinfutures({
