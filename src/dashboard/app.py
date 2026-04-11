@@ -231,7 +231,11 @@ def trading_loop():
 
                     elif state['trade_open_times'].get(sym):
                         hold_secs = time.time() - state['trade_open_times'][sym]
-                        max_hold  = CONFIG.get('max_hold_time_minutes', 15) * 60
+                        trend_component = best.get('trend', 0) if 'best' in locals() else 0
+                        if trend_component >= 25:
+                            max_hold = CONFIG.get('max_hold_strong_trend', 60) * 60
+                        else:
+                            max_hold = CONFIG.get('max_hold_time_minutes', 20) * 60
                         if hold_secs >= max_hold:
                             push_log(f"[{sym}] MAX HOLD ({hold_secs/60:.1f}min) - closing")
                             _close_trade(price, 'max_hold_time', sym)
@@ -324,6 +328,8 @@ def _execute_trade(side: str, strength: int, symbol: str):
             push_log(f"[{symbol}] Bad price")
             return
 
+        df = client.fetch_ohlcv(symbol, TF, limit=50)
+
         bal = client.fetch_balance()
         if not bal:
             push_log(f"[{symbol}] Cannot get balance")
@@ -370,10 +376,17 @@ def _execute_trade(side: str, strength: int, symbol: str):
         else:
             tp_pct = CONFIG.get('take_profit_percent', 0.6) / 100
 
-        # Minimum profit filter: skip if expected profit < $0.30
+        # Dynamic trailing stop based on volatility
+        atr_pct = scanner._estimate_atr_pct(df) if 'df' in locals() and df is not None else 1.0
+        if atr_pct > 2.0:
+            trailing_distance = CONFIG.get('trailing_stop_volatile', 0.5) / 100
+        else:
+            trailing_distance = CONFIG.get('trailing_stop_distance', 0.25) / 100
+
+        # Minimum profit filter: skip if expected profit < $1.00
         expected_profit_usd = margin_usd * leverage * tp_pct
-        if expected_profit_usd < 0.30:
-            push_log(f"[{symbol}] SKIPPED: Expected profit ${expected_profit_usd:.2f} too small (min $0.30)")
+        if expected_profit_usd < 1.0:
+            push_log(f"[{symbol}] SKIPPED: Expected profit ${expected_profit_usd:.2f} too small (min $1.00)")
             return
         sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
         tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)

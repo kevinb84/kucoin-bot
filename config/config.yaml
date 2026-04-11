@@ -16,7 +16,7 @@ leverage: 10               # Fixed at 10x (skip pairs that don't support it)
 # ===== AI Scanner Settings =====
 scanner_enabled: true
 scanner_min_score: 70      # Only trade pairs with score >= 70/100
-scanner_max_open: 2        # Max 2 concurrent positions
+scanner_max_open: 3        # Max 3 concurrent positions
 risk_per_trade: 3.0        # 3% of balance risked per trade
 
 # ===== Risk Management =====
@@ -28,10 +28,12 @@ take_profit_dynamic: true    # Enable dynamic TP
 tp_strong_trend: 1.2         # Strong trend TP
 tp_normal: 0.8               # Normal TP
 trailing_stop: true
-trailing_stop_distance: 0.25
-max_daily_loss: 15.0       # Stop after 15% daily loss
+trailing_stop_distance: 0.25      # Normal volatility
+trailing_stop_volatile: 0.5       # High volatility
+max_daily_loss: 7.0        # Stop after 7% daily loss (protect capital)
 max_drawdown: 25.0         # Hard stop at 25% drawdown
-max_hold_time_minutes: 20  # Exit after 20 min if no TP/SL
+max_hold_time_minutes: 20  # Base hold time
+max_hold_strong_trend: 60  # Strong trend hold time
 
 # ===== Strategy - 5-min optimized =====
 ema_fast: 7

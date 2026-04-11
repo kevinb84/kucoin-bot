@@ -190,7 +190,12 @@ class AdvancedMarketScanner:
             # 4. MOMENTUM/BREAKOUT (0-20 points)
             momentum_score = self._score_momentum(df, latest, prev_candles)
 
-            total_score = trend_score + volume_score + volatility_score + momentum_score
+            # 5. EDGE DETECTION PATTERNS (bonus points)
+            liquidity_score = self._score_liquidity_grab(df, latest)
+            breakout_retest_score = self._score_breakout_retest(df, latest)
+            momentum_spike_score = self._score_momentum_spike(df, latest)
+
+            total_score = trend_score + volume_score + volatility_score + momentum_score + liquidity_score + breakout_retest_score + momentum_spike_score
 
             # Determine signal direction
             signal = self._determine_signal(df, latest)
@@ -205,6 +210,9 @@ class AdvancedMarketScanner:
                 'volume':       volume_score,
                 'volatility':   volatility_score,
                 'momentum':     momentum_score,
+                'liquidity':    liquidity_score,
+                'breakout':     breakout_retest_score,
+                'spike':        momentum_spike_score,
                 'signal':       signal,
                 'min_move_pct': min_move_pct,
                 'tradeable':    total_score >= 70 and signal != 'hold',
@@ -367,6 +375,70 @@ class AdvancedMarketScanner:
 
         return min(score, 20)
 
+    def _score_liquidity_grab(self, df, latest) -> int:
+        """Detect price sweeping highs/lows then reversing."""
+        score = 0
+        if len(df) < 10:
+            return 0
+
+        high_10 = df['high'].tail(10).max()
+        low_10 = df['low'].tail(10).min()
+
+        current_high = latest['high']
+        current_low = latest['low']
+        close = latest['close']
+
+        if current_high > high_10 and close < current_high - (current_high - current_low) * 0.6:
+            score += 15
+
+        elif current_low < low_10 and close > current_low + (current_high - current_low) * 0.6:
+            score += 15
+
+        return score
+
+    def _score_breakout_retest(self, df, latest) -> int:
+        """Detect breakout from consolidation then pullback entry."""
+        score = 0
+        if len(df) < 30:
+            return 0
+
+        high_20 = df['high'].tail(20).max()
+        low_20 = df['low'].tail(20).min()
+        range_size = (high_20 - low_20) / low_20 * 100
+
+        if range_size < 2.0:
+            prev_candles = df.iloc[-5:-1]
+            breakout_detected = False
+
+            for _, candle in prev_candles.iterrows():
+                if candle['close'] > high_20 * 1.005 or candle['close'] < low_20 * 0.995:
+                    if candle['volume'] > df['volume'].tail(20).mean() * 1.5:
+                        breakout_detected = True
+                        break
+
+            if breakout_detected:
+                if abs(latest['close'] - high_20) / high_20 < 0.005:
+                    score += 20
+
+        return score
+
+    def _score_momentum_spike(self, df, latest) -> int:
+        """Detect sudden volume + candle expansion."""
+        score = 0
+        if len(df) < 20:
+            return 0
+
+        avg_volume = df['volume'].tail(20).mean()
+        avg_range = (df['high'] - df['low']).tail(20).mean()
+
+        current_volume = latest['volume']
+        current_range = latest['high'] - latest['low']
+
+        if current_volume > avg_volume * 3.0 and current_range > avg_range * 2.0:
+            score += 15
+
+        return score
+
     def _determine_signal(self, df: pd.DataFrame, latest) -> str:
         """Determine trade direction: buy, sell, or hold."""
         if 'ema_fast' not in df.columns or 'ema_slow' not in df.columns:
@@ -394,6 +466,9 @@ class AdvancedMarketScanner:
             'volume': 0,
             'volatility': 0,
             'momentum': 0,
+            'liquidity': 0,
+            'breakout': 0,
+            'spike': 0,
             'signal': 'hold',
             'min_move_pct': 0.36,
             'tradeable': False,
