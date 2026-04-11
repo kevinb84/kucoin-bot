@@ -1,9 +1,9 @@
 """
-KuCoin Advanced AI Scanner Bot
-Scans ALL KuCoin Futures pairs, scores 0-100.
-Only trades when score >= 70 AND profit > 3x fees.
-Supports up to 3 concurrent positions.
-5-minute chart with fee-aware position sizing.
+KuCoin AI Trader v7
+Weighted scoring: Model (40%) + ML (30%) + Orderflow (30%)
+Threshold: 0.65 | Micro-confirmation mandatory
+Dynamic SL/TP/Trailing based on volatility
+Max 3 positions | 7% daily stop loss
 """
 
 from flask import Flask, render_template, jsonify
@@ -33,7 +33,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'kucoin-ai-bot-2026'
+app.config['SECRET_KEY'] = 'kucoin-ai-bot-v7-2026'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ── Load config ───────────────────────────────────────────────
@@ -46,16 +46,17 @@ with open(CONFIG_PATH, 'r') as f:
 
 TF              = CONFIG.get('timeframe', '5m')
 INTERVAL        = CONFIG.get('check_interval', 15)
-MIN_SCORE       = CONFIG.get('scanner_min_score', 70)  # Now out of 100
+SCORE_THRESHOLD = CONFIG.get('score_threshold', 0.65)
 MAX_POSITIONS   = CONFIG.get('scanner_max_open', 3)
-RISK_PER_TRADE  = CONFIG.get('risk_per_trade', 3.0)  # 3% of balance per trade
+RISK_PER_TRADE  = CONFIG.get('risk_per_trade', 3.0)
+DAILY_STOP_PCT  = CONFIG.get('daily_stop_loss_pct', 7.0)
 
 # ── Shared state ──────────────────────────────────────────────
 state = {
     'is_running':      False,
     'ticker':          {},
     'candles':         [],
-    'positions':       [],     # List of open positions
+    'positions':       [],
     'last_signal':     {'signal': 'none', 'strength': 0, 'reason': ''},
     'performance':     {},
     'recent_trades':   [],
@@ -65,7 +66,9 @@ state = {
     'active_pair':     'Scanning...',
     'compounding':     {},
     'scanner_results': [],
-    'trade_open_times': {},    # symbol -> open timestamp
+    'trade_open_times': {},
+    'daily_pnl':       0.0,
+    'daily_stop_hit':  False,
 }
 
 # ── Components ────────────────────────────────────────────────
@@ -82,6 +85,36 @@ ml_predictor = TradePredictor()
 
 bot_thread    = None
 market_thread = None
+
+# ── Daily PnL tracking ────────────────────────────────────────
+daily_pnl_start = 0.0
+daily_pnl_reset_date = None
+
+
+def reset_daily_pnl_if_needed():
+    global daily_pnl_start, daily_pnl_reset_date
+    today = datetime.now().date()
+    if daily_pnl_reset_date != today:
+        daily_pnl_reset_date = today
+        daily_pnl_start = compounder.get_stats().get('current_balance', 45.0)
+        state['daily_pnl'] = 0.0
+        state['daily_stop_hit'] = False
+        push_log(f"[v7] Daily PnL reset. Starting balance: ${daily_pnl_start:.2f}")
+
+
+def check_daily_stop() -> bool:
+    global daily_pnl_start
+    if state['daily_stop_hit']:
+        return True
+    current_balance = compounder.get_stats().get('current_balance', 45.0)
+    daily_loss = daily_pnl_start - current_balance
+    daily_loss_pct = (daily_loss / daily_pnl_start) * 100 if daily_pnl_start > 0 else 0
+    state['daily_pnl'] = -daily_loss
+    if daily_loss_pct >= DAILY_STOP_PCT:
+        state['daily_stop_hit'] = True
+        push_log(f"[v7] DAILY STOP HIT! Loss: {daily_loss_pct:.2f}% (limit: {DAILY_STOP_PCT}%)")
+        return True
+    return False
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -194,12 +227,20 @@ def market_loop():
 # ─────────────────────────────────────────────────────────────
 
 def trading_loop():
-    push_log(f"AI Scanner Bot v2 | TF:{TF} | Min score:{MIN_SCORE}/100")
-    push_log(f"Max positions:{MAX_POSITIONS} | Risk:{RISK_PER_TRADE}% per trade")
+    push_log(f"AI Trader v7 | TF:{TF} | Threshold:{SCORE_THRESHOLD}")
+    push_log(f"Scoring: Model(40%) + ML(30%) + Orderflow(30%)")
+    push_log(f"Max positions:{MAX_POSITIONS} | Risk:{RISK_PER_TRADE}% | Daily stop:{DAILY_STOP_PCT}%")
     push_log("Scanning all KuCoin Futures pairs for high-probability setups...")
 
     while state['is_running']:
         try:
+            reset_daily_pnl_if_needed()
+
+            if check_daily_stop():
+                push_log("[v7] Daily stop active - no new trades until reset")
+                time.sleep(INTERVAL * 4)
+                continue
+
             state['cycle'] += 1
             cycle = state['cycle']
 
@@ -224,26 +265,25 @@ def trading_loop():
                     if risk_mgr.check_stop_loss_triggered(price):
                         push_log(f"[{sym}] STOP LOSS @ {price:.6f}")
                         _close_trade(price, 'stop_loss', sym)
-                        open_syms.remove(sym)
+                        if sym in open_syms:
+                            open_syms.remove(sym)
                         continue
 
                     elif risk_mgr.check_take_profit_triggered(price):
                         push_log(f"[{sym}] TAKE PROFIT @ {price:.6f}")
                         _close_trade(price, 'take_profit', sym)
-                        open_syms.remove(sym)
+                        if sym in open_syms:
+                            open_syms.remove(sym)
                         continue
 
                     elif state['trade_open_times'].get(sym):
                         hold_secs = time.time() - state['trade_open_times'][sym]
-                        trend_component = best.get('trend', 0) if 'best' in locals() else 0
-                        if trend_component >= 25:
-                            max_hold = CONFIG.get('max_hold_strong_trend', 60) * 60
-                        else:
-                            max_hold = CONFIG.get('max_hold_time_minutes', 20) * 60
+                        max_hold = CONFIG.get('max_hold_time_minutes', 20) * 60
                         if hold_secs >= max_hold:
                             push_log(f"[{sym}] MAX HOLD ({hold_secs/60:.1f}min) - closing")
                             _close_trade(price, 'max_hold_time', sym)
-                            open_syms.remove(sym)
+                            if sym in open_syms:
+                                open_syms.remove(sym)
                             continue
 
             # ── SCAN FOR NEW OPPORTUNITIES ──────────────────
@@ -273,6 +313,7 @@ def trading_loop():
 
                     # Add indicators for analysis
                     df = scanner._add_indicators(df)
+                    latest = df.iloc[-1]
 
                     # Run all 3 entry models
                     liq_grab = scanner._detect_liquidity_grab(df)
@@ -300,29 +341,37 @@ def trading_loop():
                         'trend_strength': best.get('trend', 0) / 30.0,
                         'volume_ratio': best.get('volume', 0) / 25.0,
                         'volatility': scanner._estimate_atr_pct(df),
-                        'rsi': latest.get('rsi', 50),
+                        'rsi': latest.get('rsi', 50) if 'rsi' in latest else 50,
                         'btc_direction': btc_direction,
                         'orderbook_imbalance': orderflow_score,
                         'distance_from_liquidity': 0,
                         'breakout_strength': best.get('momentum', 0) / 20.0,
-                        'candle_momentum': abs(df.iloc[-1]['close'] - df.iloc[-1]['open']) / df.iloc[-1]['open'] * 100
+                        'candle_momentum': abs(latest['close'] - latest['open']) / latest['open'] * 100
                     }
 
                     ml_confidence = ml_predictor.predict_win_probability(ml_features)
 
-                    # WEIGHTED SCORING (no hard blocks)
+                    # WEIGHTED SCORING: Model (40%) + ML (30%) + Orderflow (30%)
                     final_score = (
                         model_confidence * 0.4 +
                         ml_confidence * 0.3 +
                         orderflow_normalized * 0.3
                     )
 
-                    if final_score < 0.65:
-                        push_log(f"[{symbol}] Score too low ({final_score:.2f}) - skipping")
+                    if final_score < SCORE_THRESHOLD:
+                        push_log(f"[{symbol}] Score too low ({final_score:.2f} < {SCORE_THRESHOLD}) - skipping")
                         time.sleep(2)
                         continue
 
-                    push_log(f"[{symbol}] FINAL SCORE: {final_score:.2f}/1.0 | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f}")
+                    push_log(f"[{symbol}] FINAL SCORE: {final_score:.2f} | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f}")
+
+                    # Micro-confirmation MANDATORY
+                    if not scanner._micro_confirm_entry(df, best_model['signal']):
+                        push_log(f"[{symbol}] Micro-confirmation FAILED - waiting")
+                        time.sleep(INTERVAL)
+                        continue
+
+                    push_log(f"[{symbol}] Micro-confirmation PASSED")
 
                     # AI filtering: check symbol tradeability
                     tradeable, ai_reason = ai_engine.is_symbol_tradeable(symbol)
@@ -349,17 +398,11 @@ def trading_loop():
                             time.sleep(2)
                             continue
 
-                    # Micro-confirmation check
-                    if not scanner._micro_confirm_entry(df, best_model['signal']):
-                        push_log(f"[{symbol}] Waiting for confirmation candle...")
-                        time.sleep(INTERVAL)
-                        continue
-
-                    push_log(f"[#{cycle}] FOUND: {symbol} {best_model['signal'].upper()} | Model: {best_model['reason']}")
+                    push_log(f"[#{cycle}] ENTRY APPROVED: {symbol} {best_model['signal'].upper()} | Model: {best_model['reason']}")
                     state['active_pair']  = symbol
                     state['last_signal']  = best
 
-                    _execute_trade(best_model['signal'], int(final_score * 100), symbol)
+                    _execute_trade(best_model['signal'], final_score, symbol, df)
                 else:
                     push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
@@ -376,7 +419,7 @@ def trading_loop():
     push_log("Trading engine stopped")
 
 
-def _execute_trade(side: str, strength: int, symbol: str):
+def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame):
     try:
         ticker = client.fetch_ticker(symbol)
         if not ticker:
@@ -386,8 +429,6 @@ def _execute_trade(side: str, strength: int, symbol: str):
         if price <= 0:
             push_log(f"[{symbol}] Bad price")
             return
-
-        df = client.fetch_ohlcv(symbol, TF, limit=50)
 
         bal = client.fetch_balance()
         if not bal:
@@ -404,9 +445,9 @@ def _execute_trade(side: str, strength: int, symbol: str):
 
         # Dynamic position sizing: risk 2-5% based on confidence
         risk_pct = RISK_PER_TRADE
-        if strength >= 85:
+        if final_score >= 0.80:
             risk_pct = RISK_PER_TRADE * 1.5
-        elif strength < 75:
+        elif final_score < 0.70:
             risk_pct = RISK_PER_TRADE * 0.7
 
         # Dynamic stop loss based on volatility
@@ -419,7 +460,7 @@ def _execute_trade(side: str, strength: int, symbol: str):
 
         # Cap margin at available balance
         margin_usd = min(margin_usd, usdt * 0.4)
-        margin_usd = max(margin_usd, 5.0)  # Minimum $5
+        margin_usd = max(margin_usd, 5.0)
 
         # Apply loss limiter
         loss_check = intel.check_loss_limit()
@@ -429,18 +470,15 @@ def _execute_trade(side: str, strength: int, symbol: str):
 
         contracts = get_contracts(symbol, margin_usd, leverage, price)
 
-        # Dynamic TP based on trend strength
-        if CONFIG.get('take_profit_dynamic', False):
-            trend_component = best.get('trend', 0) if 'best' in locals() else 0
-            if trend_component >= 25:
-                tp_pct = CONFIG.get('tp_strong_trend', 1.2) / 100
-            else:
-                tp_pct = CONFIG.get('tp_normal', 0.8) / 100
+        # Dynamic TP based on volatility (ATR-based)
+        if atr_pct > 2.0:
+            tp_pct = CONFIG.get('tp_volatile', 1.5) / 100
+        elif atr_pct > 1.0:
+            tp_pct = CONFIG.get('tp_normal', 0.8) / 100
         else:
-            tp_pct = CONFIG.get('take_profit_percent', 0.6) / 100
+            tp_pct = CONFIG.get('tp_low_vol', 0.5) / 100
 
         # Dynamic trailing stop based on volatility
-        atr_pct = scanner._estimate_atr_pct(df) if 'df' in locals() and df is not None else 1.0
         if atr_pct > 2.0:
             trailing_distance = CONFIG.get('trailing_stop_volatile', 0.5) / 100
         else:
@@ -451,17 +489,18 @@ def _execute_trade(side: str, strength: int, symbol: str):
         if expected_profit_usd < 1.0:
             push_log(f"[{symbol}] SKIPPED: Expected profit ${expected_profit_usd:.2f} too small (min $1.00)")
             return
+
         sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
         tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)
 
         # Fee check: ensure profit > 3x fees
         expected_profit_pct = tp_pct * 100
-        fee_cost_pct = KUCOIN_FEE_RATE * 2 * 100 * leverage  # Entry + exit fees
+        fee_cost_pct = KUCOIN_FEE_RATE * 2 * 100 * leverage
         if expected_profit_pct < fee_cost_pct * 3:
             push_log(f"[{symbol}] SKIPPED: Expected profit ({expected_profit_pct:.2f}%) < 3x fees ({fee_cost_pct*3:.2f}%)")
             return
 
-        push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.6f} | margin=${margin_usd:.2f} | SL:{sl:.6f} TP:{tp:.6f}")
+        push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.6f} | margin=${margin_usd:.2f} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% Trail:{trailing_distance*100:.2f}%")
 
         order = client.create_order(symbol=symbol, order_type='market', side=side, amount=contracts)
         if order:
@@ -469,7 +508,9 @@ def _execute_trade(side: str, strength: int, symbol: str):
             risk_mgr.open_trade({
                 'symbol': symbol, 'side': side, 'entry_price': price,
                 'quantity': contracts, 'leverage': leverage,
-                'stop_loss': sl, 'take_profit': tp, 'signal_strength': strength,
+                'stop_loss': sl, 'take_profit': tp, 'signal_strength': final_score,
+                'trailing_distance': trailing_distance,
+                'atr_pct': atr_pct,
             })
             state['trade_open_times'][symbol] = time.time()
         else:
@@ -603,7 +644,7 @@ def start():
     port = int(os.environ.get('PORT', 5000))
     market_thread = threading.Thread(target=market_loop, daemon=True)
     market_thread.start()
-    logger.info(f"AI Scanner Bot v2 on port {port} | TF:{TF} | Score threshold:{MIN_SCORE}/100")
+    logger.info(f"AI Trader v7 on port {port} | TF:{TF} | Threshold:{SCORE_THRESHOLD}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
