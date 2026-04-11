@@ -23,7 +23,10 @@ risk_per_trade: 3.0        # 3% of balance risked per trade
 # Dynamic position sizing based on stop-loss distance
 # Position Size = (Balance × Risk%) ÷ SL Distance
 stop_loss_percent: 0.35    # 0.35% SL = wider, avoids noise
-take_profit_percent: 0.6   # 0.6% TP = 1.7:1 reward/risk
+take_profit_percent: 0.8     # Base TP increased
+take_profit_dynamic: true    # Enable dynamic TP
+tp_strong_trend: 1.2         # Strong trend TP
+tp_normal: 0.8               # Normal TP
 trailing_stop: true
 trailing_stop_distance: 0.25
 max_daily_loss: 15.0       # Stop after 15% daily loss

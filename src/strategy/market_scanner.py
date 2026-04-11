@@ -468,6 +468,18 @@ class AdvancedMarketScanner:
         opportunities.sort(key=lambda x: x['total_score'], reverse=True)
         return opportunities
 
+    def get_dynamic_threshold(self) -> int:
+        """Lower threshold in active markets, raise in quiet ones."""
+        active_count = sum(1 for s in self.scan_cache.values()
+                          if s.get('total_score', 0) >= 60)
+
+        if active_count >= 5:
+            return 60
+        elif active_count >= 3:
+            return 65
+        else:
+            return 70
+
     def get_best_opportunity(self, exclude_symbols: List[str] = None,
                              open_positions: int = 0) -> Optional[Dict]:
         """Get the single best trade opportunity right now."""
@@ -475,13 +487,15 @@ class AdvancedMarketScanner:
                             open_positions=open_positions)
         if opps:
             best = opps[0]
-            logger.info(
-                f"[Scanner] BEST: {best['symbol']} {best['signal'].upper()} "
-                f"score={best['total_score']}/100"
-            )
-            return best
+            threshold = self.get_dynamic_threshold()
+            if best['total_score'] >= threshold:
+                logger.info(
+                    f"[Scanner] BEST: {best['symbol']} {best['signal'].upper()} "
+                    f"score={best['total_score']}/100 (threshold={threshold})"
+                )
+                return best
 
-        logger.info("[Scanner] No qualifying opportunities (need 70+/100)")
+        logger.info("[Scanner] No qualifying opportunities (dynamic threshold)")
         return None
 
     # ── HELPER FUNCTIONS ──────────────────────────────────────

@@ -178,7 +178,7 @@ class AdaptiveIntelligenceEngine:
         if sym_perf['trades'] >= 10 and sym_perf['win_rate'] < 0.40:
             if not sym_perf['blacklisted']:
                 sym_perf['blacklisted'] = True
-                sym_perf['blacklist_until'] = time.time() + 3600 * 24  # 24 hour blacklist
+                sym_perf['blacklist_until'] = time.time() + 3600 * 3  # 3 hours only
                 logger.warning(f"[Adaptive IQ] BLACKLISTED {symbol}: win rate {sym_perf['win_rate']:.1%} after {sym_perf['trades']} trades")
 
         # Check if blacklist expired
@@ -296,6 +296,14 @@ class AdaptiveIntelligenceEngine:
             return True  # Allow untested strategies
 
         # Hard blacklist for low win rates
+        recent_trades_for_strat = [t for t in self.recent_trades[-20:]
+                                   if t.get('strategy') == strategy_name]
+        if len(recent_trades_for_strat) >= 5:
+            recent_wr = sum(1 for t in recent_trades_for_strat if t['won']) / len(recent_trades_for_strat)
+            if recent_wr < 0.40:
+                logger.warning(f"[Adaptive IQ] STRATEGY DISABLED: {strategy_name} recent WR {recent_wr:.1%}")
+                return False
+
         if perf['win_rate'] < 0.40:
             logger.warning(f"[Adaptive IQ] Blocking {strategy_name}: win rate {perf['win_rate']:.1%} too low")
             return False

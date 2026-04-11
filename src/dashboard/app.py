@@ -250,6 +250,15 @@ def trading_loop():
                     open_positions=open_count
                 )
 
+                # Aggression mode: adjust based on recent performance
+                recent_wins = sum(1 for t in ai_engine.recent_trades[-10:] if t['won']) if ai_engine.recent_trades else 0
+                recent_wr = recent_wins / min(len(ai_engine.recent_trades), 10) if ai_engine.recent_trades else 0
+
+                if recent_wr > 0.60:
+                    push_log(f"[AI] AGGRESSION MODE: Recent WR {recent_wr:.1%} - lowering entry bar")
+                elif recent_wr < 0.35:
+                    push_log(f"[AI] DEFENSIVE MODE: Recent WR {recent_wr:.1%} - raising standards")
+
                 if best and best.get('tradeable'):
                     symbol = best['symbol']
                     side   = best['signal']
@@ -351,7 +360,21 @@ def _execute_trade(side: str, strength: int, symbol: str):
 
         contracts = get_contracts(symbol, margin_usd, leverage, price)
 
-        tp_pct = CONFIG.get('take_profit_percent', 0.5) / 100
+        # Dynamic TP based on trend strength
+        if CONFIG.get('take_profit_dynamic', False):
+            trend_component = best.get('trend', 0) if 'best' in locals() else 0
+            if trend_component >= 25:
+                tp_pct = CONFIG.get('tp_strong_trend', 1.2) / 100
+            else:
+                tp_pct = CONFIG.get('tp_normal', 0.8) / 100
+        else:
+            tp_pct = CONFIG.get('take_profit_percent', 0.6) / 100
+
+        # Minimum profit filter: skip if expected profit < $0.30
+        expected_profit_usd = margin_usd * leverage * tp_pct
+        if expected_profit_usd < 0.30:
+            push_log(f"[{symbol}] SKIPPED: Expected profit ${expected_profit_usd:.2f} too small (min $0.30)")
+            return
         sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
         tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)
 
