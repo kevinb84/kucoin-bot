@@ -1,11 +1,12 @@
 """
-KuCoin Smart Scanner Bot
-Scans 20 KuCoin Futures pairs every cycle.
-Only trades when confidence >= 7/10.
-5-minute chart. One open position at a time.
+KuCoin Advanced AI Scanner Bot
+Scans ALL KuCoin Futures pairs, scores 0-100.
+Only trades when score >= 70 AND profit > 3x fees.
+Supports up to 3 concurrent positions.
+5-minute chart with fee-aware position sizing.
 """
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify
 from flask_socketio import SocketIO, emit
 import threading
 import time
@@ -19,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from src.api.kucoin_client import KuCoinClient
 from src.strategy.trend_following import TrendFollowingStrategy
-from src.strategy.market_scanner import MarketScanner, CONTRACT_SIZE
+from src.strategy.market_scanner import AdvancedMarketScanner, CONTRACT_SIZE, KUCOIN_FEE_RATE
 from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
 from src.learning.compounding_engine import CompoundingEngine
@@ -29,7 +30,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'kucoin-bot-2026'
+app.config['SECRET_KEY'] = 'kucoin-ai-bot-2026'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ── Load config ───────────────────────────────────────────────
@@ -40,16 +41,18 @@ CONFIG_PATH = os.path.join(
 with open(CONFIG_PATH, 'r') as f:
     CONFIG = yaml.safe_load(f)
 
-TF             = CONFIG.get('timeframe', '5m')
-INTERVAL       = CONFIG.get('check_interval', 15)
-MIN_SCORE      = CONFIG.get('scanner_min_score', 7)
+TF              = CONFIG.get('timeframe', '5m')
+INTERVAL        = CONFIG.get('check_interval', 15)
+MIN_SCORE       = CONFIG.get('scanner_min_score', 70)  # Now out of 100
+MAX_POSITIONS   = CONFIG.get('scanner_max_open', 3)
+RISK_PER_TRADE  = CONFIG.get('risk_per_trade', 3.0)  # 3% of balance per trade
 
 # ── Shared state ──────────────────────────────────────────────
 state = {
     'is_running':      False,
     'ticker':          {},
     'candles':         [],
-    'position':        None,
+    'positions':       [],     # List of open positions
     'last_signal':     {'signal': 'none', 'strength': 0, 'reason': ''},
     'performance':     {},
     'recent_trades':   [],
@@ -58,9 +61,8 @@ state = {
     'last_update':     '',
     'active_pair':     'Scanning...',
     'compounding':     {},
-    'scanner_results': [],   # Latest scan scores for all pairs
-    'trade_open_time': None,
-    'current_symbol':  None, # Symbol of current open trade
+    'scanner_results': [],
+    'trade_open_times': {},    # symbol -> open timestamp
 }
 
 # ── Components ────────────────────────────────────────────────
@@ -68,11 +70,9 @@ client     = KuCoinClient()
 journal    = TradeJournal(db_path=CONFIG.get('journal_db_path', 'trading_journal.db'))
 strategy   = TrendFollowingStrategy(CONFIG)
 risk_mgr   = AdvancedRiskManager(CONFIG)
-risk_mgr.trade_history = []
-risk_mgr.daily_pnl     = 0.0
 intel      = MarketIntelligence(client)
-compounder = CompoundingEngine(starting_balance=45.0, risk_pct=20.0)
-scanner    = MarketScanner(client, strategy, intel, timeframe=TF)
+compounder = CompoundingEngine(starting_balance=45.0, risk_pct=RISK_PER_TRADE * 10)
+scanner    = AdvancedMarketScanner(client, strategy, intel, timeframe=TF)
 
 bot_thread    = None
 market_thread = None
@@ -117,7 +117,6 @@ def get_contracts(symbol: str, margin_usd: float, leverage: int, price: float) -
 
 
 def update_performance():
-    # Collect recent trades from journal (all pairs)
     all_trades = journal.get_recent_trades(limit=20)
     state['recent_trades'] = all_trades
     state['performance']   = journal.get_trade_statistics()
@@ -131,23 +130,25 @@ def update_performance():
 
 
 # ─────────────────────────────────────────────────────────────
-#  MARKET DATA THREAD (charts + positions)
+#  MARKET DATA THREAD
 # ─────────────────────────────────────────────────────────────
 
 def market_loop():
     logger.info("Market data loop started")
     while True:
         try:
-            # Show chart for active symbol (or BTC if none)
-            active = state.get('current_symbol') or 'XBTUSDTM'
-            df = client.fetch_ohlcv(active, TF, limit=100)
+            # Show chart for first active symbol or BTC
+            active_syms = list(state.get('trade_open_times', {}).keys())
+            display_sym = active_syms[0] if active_syms else 'XBTUSDTM'
+
+            df = client.fetch_ohlcv(display_sym, TF, limit=100)
             if df is not None and not df.empty:
                 state['candles'] = df_to_candles(df)
 
-            ticker = client.fetch_ticker(active)
+            ticker = client.fetch_ticker(display_sym)
             if ticker:
                 state['ticker'] = {
-                    'symbol': active,
+                    'symbol': display_sym,
                     'price':  ticker.get('last', 0),
                     'change': ticker.get('percentage', 0),
                     'high':   ticker.get('high', 0),
@@ -155,23 +156,21 @@ def market_loop():
                     'volume': ticker.get('baseVolume', 0),
                 }
 
-            # Check open position
-            if state.get('current_symbol'):
-                pos = client.fetch_position(state['current_symbol'])
+            # Check all open positions
+            positions = []
+            for sym in list(state.get('trade_open_times', {}).keys()):
+                pos = client.fetch_position(sym)
                 if pos and float(pos.get('contracts', 0) or 0) != 0:
-                    state['position'] = {
-                        'symbol':         state['current_symbol'],
+                    positions.append({
+                        'symbol':         sym,
                         'side':           'long' if float(pos.get('contracts', 0)) > 0 else 'short',
                         'size':           pos.get('contracts', 0),
                         'entry_price':    pos.get('entryPrice', 0),
                         'mark_price':     pos.get('markPrice', 0),
                         'unrealized_pnl': pos.get('unrealizedPnl', 0),
                         'leverage':       pos.get('leverage', 10),
-                    }
-                else:
-                    state['position'] = None
-            else:
-                state['position'] = None
+                    })
+            state['positions'] = positions
 
             state['last_update'] = datetime.now().strftime('%H:%M:%S')
             update_performance()
@@ -184,71 +183,88 @@ def market_loop():
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRADING ENGINE - SCANNER DRIVEN
+#  TRADING ENGINE - AI SCANNER DRIVEN
 # ─────────────────────────────────────────────────────────────
 
 def trading_loop():
-    from src.strategy.market_scanner import WATCHLIST as SCANNER_WATCHLIST
-    push_log(f"Scanner Bot started | TF:{TF} | Min score:{MIN_SCORE}/10 | Scanning {len(SCANNER_WATCHLIST)} pairs")
-    push_log("Will scan all pairs and only trade when confidence >= 7/10")
+    push_log(f"AI Scanner Bot v2 | TF:{TF} | Min score:{MIN_SCORE}/100")
+    push_log(f"Max positions:{MAX_POSITIONS} | Risk:{RISK_PER_TRADE}% per trade")
+    push_log("Scanning all KuCoin Futures pairs for high-probability setups...")
 
     while state['is_running']:
         try:
             state['cycle'] += 1
             cycle = state['cycle']
 
-            # ── MANAGE EXISTING POSITION ────────────────────
-            current_sym = state.get('current_symbol')
-            if current_sym and risk_mgr.open_position:
-                ticker = client.fetch_ticker(current_sym)
-                if ticker:
-                    price = float(ticker.get('last', 0))
+            # ── MANAGE EXISTING POSITIONS ───────────────────
+            open_syms = list(state.get('trade_open_times', {}).keys())
+
+            for sym in open_syms[:]:
+                ticker = client.fetch_ticker(sym)
+                if not ticker:
+                    continue
+
+                price = float(ticker.get('last', 0))
+                if price <= 0:
+                    continue
+
+                # Update risk manager tracking
+                if risk_mgr.open_position and risk_mgr.open_position.get('symbol') == sym:
                     risk_mgr.update_position_tracking(price)
                     risk_mgr.update_trailing_stop(price, risk_mgr.open_position.get('side', 'buy'))
 
+                    # Check exit conditions
                     if risk_mgr.check_stop_loss_triggered(price):
-                        push_log(f"[{current_sym}] STOP LOSS @ {price:.6f}")
-                        _close_trade(price, 'stop_loss', current_sym)
+                        push_log(f"[{sym}] STOP LOSS @ {price:.6f}")
+                        _close_trade(price, 'stop_loss', sym)
+                        open_syms.remove(sym)
+                        continue
 
                     elif risk_mgr.check_take_profit_triggered(price):
-                        push_log(f"[{current_sym}] TAKE PROFIT @ {price:.6f}")
-                        _close_trade(price, 'take_profit', current_sym)
+                        push_log(f"[{sym}] TAKE PROFIT @ {price:.6f}")
+                        _close_trade(price, 'take_profit', sym)
+                        open_syms.remove(sym)
+                        continue
 
-                    elif state.get('trade_open_time'):
-                        hold_secs = time.time() - state['trade_open_time']
+                    elif state['trade_open_times'].get(sym):
+                        hold_secs = time.time() - state['trade_open_times'][sym]
                         max_hold  = CONFIG.get('max_hold_time_minutes', 15) * 60
                         if hold_secs >= max_hold:
-                            push_log(f"[{current_sym}] MAX HOLD ({hold_secs/60:.1f}min) - closing")
-                            _close_trade(price, 'max_hold_time', current_sym)
+                            push_log(f"[{sym}] MAX HOLD ({hold_secs/60:.1f}min) - closing")
+                            _close_trade(price, 'max_hold_time', sym)
+                            open_syms.remove(sym)
+                            continue
 
-                    else:
-                        push_log(f"[{current_sym}] IN POSITION @ {price:.6f} | PnL: {risk_mgr.open_position.get('unrealized_pnl', 0):.4f}")
+            # ── SCAN FOR NEW OPPORTUNITIES ──────────────────
+            open_count = len(state.get('trade_open_times', {}))
 
-                time.sleep(INTERVAL)
-                continue
+            if open_count < MAX_POSITIONS:
+                push_log(f"[#{cycle}] Scanning market... ({open_count}/{MAX_POSITIONS} positions open)")
+                state['active_pair'] = 'Scanning...'
 
-            # ── SCAN MARKET FOR BEST OPPORTUNITY ────────────
-            push_log(f"[#{cycle}] Scanning 20 pairs for opportunities...")
-            state['active_pair'] = 'Scanning...'
+                best = scanner.get_best_opportunity(
+                    exclude_symbols=open_syms,
+                    open_positions=open_count
+                )
 
-            best = scanner.get_best_opportunity(exclude_symbols=[current_sym] if current_sym else [])
+                if best and best.get('tradeable'):
+                    symbol = best['symbol']
+                    side   = best['signal']
+                    score  = best['total_score']
+                    reason = best.get('reason', '')[:100]
 
-            if best and best.get('tradeable'):
-                symbol = best['symbol']
-                side   = best['side']
-                score  = best['score']
-                reason = best.get('reason', '')[:100]
+                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} score={score}/100")
+                    push_log(f"  Reason: {reason}")
+                    state['active_pair']  = symbol
+                    state['last_signal']  = best
 
-                push_log(f"[#{cycle}] BEST: {symbol} {side.upper()} score={score}/10")
-                push_log(f"  Reason: {reason}")
-                state['active_pair']  = symbol
-                state['last_signal']  = best.get('signal', {})
-
-                _execute_trade(side, score, symbol)
-
+                    _execute_trade(side, score, symbol)
+                else:
+                    push_log(f"[#{cycle}] No qualifying setups (need {MIN_SCORE}+/100). Waiting...")
+                    state['active_pair'] = 'Waiting for setup...'
             else:
-                push_log(f"[#{cycle}] No high-confidence setup found. Waiting...")
-                state['active_pair'] = 'Waiting for setup...'
+                push_log(f"[#{cycle}] Max positions ({MAX_POSITIONS}) reached. Managing open trades...")
+                state['active_pair'] = f'{open_count} positions open'
 
         except Exception as e:
             push_log(f"Loop error: {str(e)[:80]}")
@@ -282,7 +298,21 @@ def _execute_trade(side: str, strength: int, symbol: str):
 
         leverage = CONFIG.get('leverage', 10)
         compounder.update_balance(usdt)
-        margin_usd = max(compounder.get_position_size_usd(), 1.0)
+
+        # Dynamic position sizing: risk 2-5% based on confidence
+        risk_pct = RISK_PER_TRADE
+        if strength >= 85:
+            risk_pct = RISK_PER_TRADE * 1.5  # Increase for very high confidence
+        elif strength < 75:
+            risk_pct = RISK_PER_TRADE * 0.7  # Reduce for marginal setups
+
+        # Calculate position size from stop-loss distance
+        sl_pct = CONFIG.get('stop_loss_percent', 0.3) / 100
+        margin_usd = (usdt * risk_pct / 100) / sl_pct if sl_pct > 0 else usdt * 0.03
+
+        # Cap margin at available balance
+        margin_usd = min(margin_usd, usdt * 0.4)
+        margin_usd = max(margin_usd, 5.0)  # Minimum $5
 
         # Apply loss limiter
         loss_check = intel.check_loss_limit()
@@ -290,15 +320,18 @@ def _execute_trade(side: str, strength: int, symbol: str):
             margin_usd = margin_usd * loss_check['position_multiplier']
             push_log(f"[{symbol}] Size reduced: {loss_check['reason']}")
 
-        # Cap margin at available balance
-        margin_usd = min(margin_usd, usdt * 0.5)
-
         contracts = get_contracts(symbol, margin_usd, leverage, price)
 
-        sl_pct = CONFIG.get('stop_loss_percent', 0.3) / 100
         tp_pct = CONFIG.get('take_profit_percent', 0.5) / 100
         sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
         tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)
+
+        # Fee check: ensure profit > 3x fees
+        expected_profit_pct = tp_pct * 100
+        fee_cost_pct = KUCOIN_FEE_RATE * 2 * 100 * leverage  # Entry + exit fees
+        if expected_profit_pct < fee_cost_pct * 3:
+            push_log(f"[{symbol}] SKIPPED: Expected profit ({expected_profit_pct:.2f}%) < 3x fees ({fee_cost_pct*3:.2f}%)")
+            return
 
         push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.6f} | margin=${margin_usd:.2f} | SL:{sl:.6f} TP:{tp:.6f}")
 
@@ -310,8 +343,7 @@ def _execute_trade(side: str, strength: int, symbol: str):
                 'quantity': contracts, 'leverage': leverage,
                 'stop_loss': sl, 'take_profit': tp, 'signal_strength': strength,
             })
-            state['trade_open_time'] = time.time()
-            state['current_symbol']  = symbol
+            state['trade_open_times'][symbol] = time.time()
         else:
             push_log(f"[{symbol}] Order FAILED")
 
@@ -340,13 +372,13 @@ def _close_trade(exit_price: float, reason: str, symbol: str):
                 pnl = result.get('pnl', 0)
                 compounder.record_trade(pnl, side, symbol)
                 intel.record_trade_result(won=(pnl >= 0))
+                scanner.record_trade_result(symbol, won=(pnl >= 0), pnl=pnl)
                 tag = 'WIN ✓' if pnl >= 0 else 'LOSS ✗'
                 push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
         else:
             push_log(f"[{symbol}] CLOSE FAILED!")
 
-        state['trade_open_time'] = None
-        state['current_symbol']  = None
+        state['trade_open_times'].pop(symbol, None)
 
     except Exception as e:
         push_log(f"[{symbol}] Close error: {str(e)[:100]}")
@@ -410,8 +442,7 @@ def start():
     port = int(os.environ.get('PORT', 5000))
     market_thread = threading.Thread(target=market_loop, daemon=True)
     market_thread.start()
-    from src.strategy.market_scanner import WATCHLIST as SCANNER_WATCHLIST
-    logger.info(f"Smart Scanner Bot on port {port} | Scanning {len(SCANNER_WATCHLIST)} pairs | TF:{TF}")
+    logger.info(f"AI Scanner Bot v2 on port {port} | TF:{TF} | Score threshold:{MIN_SCORE}/100")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
 

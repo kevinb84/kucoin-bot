@@ -1,7 +1,7 @@
-# KuCoin Smart Scanner Bot - Finds best opportunities across ALL futures pairs
-# Scans 20 pairs, only trades when confidence >= 7/10
-# Balance: ~$45 | Leverage: 10x | $20 margin = $200 position
-# Math: $200 position × 0.5% move = $1.00 profit per win
+# KuCoin Advanced AI Scanner Bot v2
+# Scans ALL futures pairs, 100-point scoring, fee-aware trading
+# Balance: ~$45 | Leverage: 10x | Risk: 3% per trade
+# Only trades when score >= 70 AND expected profit > 3x fees
 
 # ===== API =====
 api_key: ""
@@ -9,36 +9,32 @@ api_secret: ""
 api_passphrase: ""
 
 # ===== Trading - 5 MINUTE CHART =====
-symbol: "XBTUSDTM"       # Fallback symbol if scanner finds nothing
 timeframe: "5m"
-check_interval: 15        # Scanner runs every 15 seconds
-leverage: 10
+check_interval: 12        # Scanner runs every 12 seconds
+leverage: 10               # Fixed at 10x (skip pairs that don't support it)
 
-# ===== Scanner Settings =====
+# ===== AI Scanner Settings =====
 scanner_enabled: true
-scanner_min_score: 7      # Only trade pairs with score >= 7/10
-scanner_max_open: 1       # Max 1 open position at a time
-scanner_interval: 60      # Re-scan all pairs every 60 seconds
+scanner_min_score: 70      # Only trade pairs with score >= 70/100
+scanner_max_open: 2        # Max 2 concurrent positions
+risk_per_trade: 3.0        # 3% of balance risked per trade
 
 # ===== Risk Management =====
-# $20 margin × 10x = $200 position
-# TP: 0.5% = $1.00 profit per win
-# SL: 0.3% = $0.60 max loss  → 1.67:1 reward/risk
-max_position_size: 25
-risk_per_trade: 20.0
-stop_loss_percent: 0.3    # 0.3% SL = $0.60 max loss
-take_profit_percent: 0.5  # 0.5% TP = $1.00 profit per win
+# Dynamic position sizing based on stop-loss distance
+# Position Size = (Balance × Risk%) ÷ SL Distance
+stop_loss_percent: 0.35    # 0.35% SL = wider, avoids noise
+take_profit_percent: 0.6   # 0.6% TP = 1.7:1 reward/risk
 trailing_stop: true
-trailing_stop_distance: 0.2
-max_daily_loss: 15.0
-max_drawdown: 20.0
-max_hold_time_minutes: 15  # Exit after 15 min if no TP/SL
+trailing_stop_distance: 0.25
+max_daily_loss: 15.0       # Stop after 15% daily loss
+max_drawdown: 25.0         # Hard stop at 25% drawdown
+max_hold_time_minutes: 20  # Exit after 20 min if no TP/SL
 
 # ===== Strategy - 5-min optimized =====
 ema_fast: 7
 ema_slow: 21
 ema_signal_threshold: 0.1
-min_signal_strength: 7     # Only trade 7+ strength signals
+min_signal_strength: 7
 rsi_period: 14
 rsi_overbought: 65
 rsi_oversold: 35
@@ -49,31 +45,6 @@ rsi_extreme_oversold: 20
 confirm_with_higher_tf: true
 volume_threshold: 1.2
 exit_on_opposite_signal: true
-
-# ===== Multi-Pair (managed by scanner) =====
-multi_pair_trading:
-  enabled: true
-  pairs:
-    - "XBTUSDTM"
-    - "ETHUSDTM"
-    - "SOLUSDTM"
-    - "XRPUSDTM"
-    - "DOGEUSDTM"
-    - "ADAUSDTM"
-    - "AVAXUSDTM"
-    - "LINKUSDTM"
-    - "BNBUSDTM"
-    - "LTCUSDTM"
-    - "DOTUSDTM"
-    - "BCHUHDTM"
-    - "UNIUSDTM"
-    - "ATOMUSDTM"
-    - "NEARUSDTM"
-    - "MATICUSDTM"
-    - "AAVEUSDTM"
-    - "FILUSDTM"
-    - "TRXUSDTM"
-    - "ETCUSDTM"
 
 # ===== Self-Learning =====
 learning_enabled: true
