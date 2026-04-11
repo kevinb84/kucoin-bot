@@ -228,7 +228,7 @@ def trading_loop():
                 continue
 
             # ── SCAN MARKET FOR BEST OPPORTUNITY ────────────
-            push_log(f"[#{cycle}] Scanning {len(scanner.WATCHLIST)} pairs for opportunities...")
+            push_log(f"[#{cycle}] Scanning 20 pairs for opportunities...")
             state['active_pair'] = 'Scanning...'
 
             best = scanner.get_best_opportunity(exclude_symbols=[current_sym] if current_sym else [])
