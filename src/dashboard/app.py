@@ -188,7 +188,8 @@ def market_loop():
 # ─────────────────────────────────────────────────────────────
 
 def trading_loop():
-    push_log(f"Scanner Bot started | TF:{TF} | Min score:{MIN_SCORE}/10 | Scanning {len(scanner.WATCHLIST)} pairs")
+    from src.strategy.market_scanner import WATCHLIST as SCANNER_WATCHLIST
+    push_log(f"Scanner Bot started | TF:{TF} | Min score:{MIN_SCORE}/10 | Scanning {len(SCANNER_WATCHLIST)} pairs")
     push_log("Will scan all pairs and only trade when confidence >= 7/10")
 
     while state['is_running']:
@@ -409,7 +410,8 @@ def start():
     port = int(os.environ.get('PORT', 5000))
     market_thread = threading.Thread(target=market_loop, daemon=True)
     market_thread.start()
-    logger.info(f"Smart Scanner Bot on port {port} | Scanning {len(scanner.WATCHLIST)} pairs | TF:{TF}")
+    from src.strategy.market_scanner import WATCHLIST as SCANNER_WATCHLIST
+    logger.info(f"Smart Scanner Bot on port {port} | Scanning {len(SCANNER_WATCHLIST)} pairs | TF:{TF}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
