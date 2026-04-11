@@ -400,7 +400,8 @@ def trading_loop():
 
                     push_log(f"[#{cycle}] ENTRY APPROVED: {symbol} {best_model['signal'].upper()} | Model: {best_model['reason']}")
                     state['active_pair']  = symbol
-                    state['last_signal']  = best
+                    # Don't store 'best' in state (contains non-serializable data)
+                    # state['last_signal']  = best
 
                     _execute_trade(best_model['signal'], final_score, symbol, df)
                 else:
