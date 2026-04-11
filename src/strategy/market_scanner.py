@@ -164,58 +164,207 @@ class AdvancedMarketScanner:
 
     # ── SMART 100-POINT SCORING SYSTEM ────────────────────────
 
+    # ── CUSTOM ENTRY MODELS ───────────────────────────────────
+
+    def _detect_liquidity_grab(self, df) -> Dict:
+        """
+        Detect stop hunts above/below key levels with strong rejection.
+        Returns: {'signal': 'buy'/'sell', 'confidence': 0-1, 'reason': str}
+        """
+        if len(df) < 20:
+            return {'signal': 'hold', 'confidence': 0, 'reason': 'Insufficient data'}
+        
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else latest
+        
+        # Find recent swing highs/lows (last 20 candles)
+        high_20 = df['high'].tail(20).max()
+        low_20 = df['low'].tail(20).min()
+        
+        current_high = latest['high']
+        current_low = latest['low']
+        close = latest['close']
+        open_price = latest['open']
+        
+        # Bullish reversal: swept low then rejected
+        if current_low < low_20 and close > low_20:
+            # Strong rejection wick (lower wick > 60% of candle)
+            candle_range = current_high - current_low
+            lower_wick = min(close, open_price) - current_low
+            if candle_range > 0 and lower_wick / candle_range > 0.6:
+                return {
+                    'signal': 'buy',
+                    'confidence': 0.75,
+                    'reason': f'Liquidity grab below {low_20:.4f}, strong rejection'
+                }
+        
+        # Bearish reversal: swept high then rejected
+        if current_high > high_20 and close < high_20:
+            candle_range = current_high - current_low
+            upper_wick = current_high - max(close, open_price)
+            if candle_range > 0 and upper_wick / candle_range > 0.6:
+                return {
+                    'signal': 'sell',
+                    'confidence': 0.75,
+                    'reason': f'Liquidity grab above {high_20:.4f}, strong rejection'
+                }
+        
+        return {'signal': 'hold', 'confidence': 0, 'reason': 'No liquidity grab detected'}
+
+    def _detect_breakout_retest(self, df) -> Dict:
+        """
+        Identify breakout from consolidation, wait for pullback retest.
+        Returns: {'signal': 'buy'/'sell', 'confidence': 0-1, 'reason': str}
+        """
+        if len(df) < 30:
+            return {'signal': 'hold', 'confidence': 0, 'reason': 'Insufficient data'}
+        
+        latest = df.iloc[-1]
+        
+        # Find consolidation range (candles 5-25, excluding recent 5)
+        consolidation = df.iloc[5:25]
+        high_range = consolidation['high'].max()
+        low_range = consolidation['low'].min()
+        
+        # Consolidation must be tight (< 2% range)
+        range_pct = (high_range - low_range) / low_range * 100
+        if range_pct > 2.0:
+            return {'signal': 'hold', 'confidence': 0, 'reason': 'No consolidation detected'}
+        
+        # Check if price broke out recently (last 5 candles)
+        recent_5 = df.tail(5)
+        breakout_detected = False
+        breakout_direction = None
+        
+        for _, candle in recent_5.iterrows():
+            if candle['close'] > high_range * 1.005:
+                breakout_detected = True
+                breakout_direction = 'buy'
+                break
+            elif candle['close'] < low_range * 0.995:
+                breakout_detected = True
+                breakout_direction = 'sell'
+                break
+        
+        if not breakout_detected:
+            return {'signal': 'hold', 'confidence': 0, 'reason': 'No breakout yet'}
+        
+        # Current candle should be pullback/retest
+        if breakout_direction == 'buy':
+            # Price pulled back to resistance level (now support)
+            if abs(latest['close'] - high_range) / high_range < 0.008:  # Within 0.8%
+                # Check for bullish confirmation (green candle or hammer)
+                if latest['close'] > latest['open']:
+                    return {
+                        'signal': 'buy',
+                        'confidence': 0.80,
+                        'reason': f'Breakout above {high_range:.4f}, retest confirmed'
+                    }
+        else:
+            # Price pulled back to support level (now resistance)
+            if abs(latest['close'] - low_range) / low_range < 0.008:
+                if latest['close'] < latest['open']:
+                    return {
+                        'signal': 'sell',
+                        'confidence': 0.80,
+                        'reason': f'Breakdown below {low_range:.4f}, retest confirmed'
+                    }
+        
+        return {'signal': 'hold', 'confidence': 0, 'reason': 'Waiting for retest'}
+
+    def _detect_momentum_ignition(self, df) -> Dict:
+        """
+        Detect sudden volume spike + candle expansion.
+        Returns: {'signal': 'buy'/'sell', 'confidence': 0-1, 'reason': str}
+        """
+        if len(df) < 20:
+            return {'signal': 'hold', 'confidence': 0, 'reason': 'Insufficient data'}
+        
+        latest = df.iloc[-1]
+        avg_volume = df['volume'].tail(20).mean()
+        avg_range = (df['high'] - df['low']).tail(20).mean()
+        
+        current_volume = latest['volume']
+        current_range = latest['high'] - latest['low']
+        
+        # Volume spike > 3x average AND candle range > 2x average
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        range_ratio = current_range / avg_range if avg_range > 0 else 0
+        
+        if volume_ratio > 3.0 and range_ratio > 2.0:
+            # Determine direction
+            body = latest['close'] - latest['open']
+            if body > 0:
+                return {
+                    'signal': 'buy',
+                    'confidence': 0.70,
+                    'reason': f'Momentum ignition: vol {volume_ratio:.1f}x, range {range_ratio:.1f}x'
+                }
+            else:
+                return {
+                    'signal': 'sell',
+                    'confidence': 0.70,
+                    'reason': f'Momentum ignition: vol {volume_ratio:.1f}x, range {range_ratio:.1f}x'
+                }
+        
+        return {'signal': 'hold', 'confidence': 0, 'reason': 'No momentum spike'}
+
     def score_pair(self, symbol: str, df: pd.DataFrame) -> Dict:
         """
-        Score a trading pair 0-100 based on 4 factors:
-        - Trend Strength (30 pts)
-        - Volume Strength (25 pts)
-        - Volatility Level (25 pts)
-        - Momentum/Breakout (20 pts)
-
-        Returns dict with total score and breakdown.
+        Score a trading pair using THREE dedicated entry models:
+        - Model A: Liquidity Grab + Reversal
+        - Model B: Breakout + Retest
+        - Model C: Momentum Ignition
+        
+        Returns dict with best model signal and confidence.
         """
         try:
+            # Run all three entry models
+            liq_grab = self._detect_liquidity_grab(df)
+            breakout = self._detect_breakout_retest(df)
+            momentum = self._detect_momentum_ignition(df)
+            
+            # Pick highest confidence model
+            models = [liq_grab, breakout, momentum]
+            best_model = max(models, key=lambda x: x['confidence'])
+            
+            # Calculate supporting metrics for ML filter
             latest = df.iloc[-1]
-            prev_candles = df.iloc[-5:]
-
-            # 1. TREND STRENGTH (0-30 points)
-            trend_score = self._score_trend(df, latest)
-
-            # 2. VOLUME STRENGTH (0-25 points)
-            volume_score = self._score_volume(df, latest)
-
-            # 3. VOLATILITY LEVEL (0-25 points)
-            volatility_score = self._score_volatility(df, prev_candles)
-
-            # 4. MOMENTUM/BREAKOUT (0-20 points)
-            momentum_score = self._score_momentum(df, latest, prev_candles)
-
-            # 5. EDGE DETECTION PATTERNS (bonus points)
-            liquidity_score = self._score_liquidity_grab(df, latest)
-            breakout_retest_score = self._score_breakout_retest(df, latest)
-            momentum_spike_score = self._score_momentum_spike(df, latest)
-
-            total_score = trend_score + volume_score + volatility_score + momentum_score + liquidity_score + breakout_retest_score + momentum_spike_score
-
-            # Determine signal direction
-            signal = self._determine_signal(df, latest)
-
+            avg_vol_20 = df['volume'].tail(20).mean()
+            volume_ratio = latest['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+            
+            # Trend strength (simplified for ML)
+            if 'ema_fast' in df.columns and 'ema_slow' in df.columns:
+                spread_pct = abs(latest['ema_fast'] - latest['ema_slow']) / latest['ema_slow'] * 100
+                trend_strength = min(spread_pct / 0.5 * 30, 30)
+            else:
+                trend_strength = 15
+            
+            # Determine if tradeable (confidence >= 0.65)
+            tradeable = best_model['confidence'] >= 0.65 and best_model['signal'] != 'hold'
+            
             # Calculate minimum profitable move (3x fees)
             min_move_pct = (KUCOIN_FEE_RATE * 2 * 3) * 100  # ~0.36%
-
+            
             return {
-                'symbol':       symbol,
-                'total_score':  total_score,
-                'trend':        trend_score,
-                'volume':       volume_score,
-                'volatility':   volatility_score,
-                'momentum':     momentum_score,
-                'liquidity':    liquidity_score,
-                'breakout':     breakout_retest_score,
-                'spike':        momentum_spike_score,
-                'signal':       signal,
-                'min_move_pct': min_move_pct,
-                'tradeable':    total_score >= 70 and signal != 'hold',
+                'symbol':         symbol,
+                'total_score':    int(best_model['confidence'] * 100),
+                'trend':          trend_strength,
+                'volume':         volume_ratio * 25,
+                'volatility':     self._estimate_atr_pct(df) * 5,
+                'momentum':       0,
+                'liquidity':      liq_grab['confidence'] * 20,
+                'breakout':       breakout['confidence'] * 25,
+                'spike':          momentum['confidence'] * 15,
+                'signal':         best_model['signal'],
+                'min_move_pct':   min_move_pct,
+                'tradeable':      tradeable,
+                'best_model':     best_model,
+                'all_models':     {
+                    'liquidity_grab': liq_grab,
+                    'breakout_retest': breakout,
+                    'momentum_ignition': momentum,
+                },
             }
 
         except Exception as e:

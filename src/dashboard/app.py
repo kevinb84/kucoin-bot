@@ -21,11 +21,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from src.api.kucoin_client import KuCoinClient
 from src.strategy.trend_following import TrendFollowingStrategy
 from src.strategy.market_scanner import AdvancedMarketScanner, CONTRACT_SIZE, KUCOIN_FEE_RATE
+from src.strategy.order_flow import OrderFlowAnalyzer
 from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
 from src.learning.compounding_engine import CompoundingEngine
 from src.strategy.market_intelligence import MarketIntelligence
 from src.learning.adaptive_intelligence import AdaptiveIntelligenceEngine
+from src.ml.trade_predictor import TradePredictor
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -75,6 +77,8 @@ intel      = MarketIntelligence(client)
 compounder = CompoundingEngine(starting_balance=45.0, risk_pct=RISK_PER_TRADE * 10)
 scanner    = AdvancedMarketScanner(client, strategy, intel, timeframe=TF)
 ai_engine  = AdaptiveIntelligenceEngine(journal, scanner, CONFIG)
+order_analyzer = OrderFlowAnalyzer(client)
+ml_predictor = TradePredictor()
 
 bot_thread    = None
 market_thread = None
@@ -254,20 +258,68 @@ def trading_loop():
                     open_positions=open_count
                 )
 
-                # Aggression mode: adjust based on recent performance
-                recent_wins = sum(1 for t in ai_engine.recent_trades[-10:] if t['won']) if ai_engine.recent_trades else 0
-                recent_wr = recent_wins / min(len(ai_engine.recent_trades), 10) if ai_engine.recent_trades else 0
-
-                if recent_wr > 0.60:
-                    push_log(f"[AI] AGGRESSION MODE: Recent WR {recent_wr:.1%} - lowering entry bar")
-                elif recent_wr < 0.35:
-                    push_log(f"[AI] DEFENSIVE MODE: Recent WR {recent_wr:.1%} - raising standards")
-
                 if best and best.get('tradeable'):
                     symbol = best['symbol']
                     side   = best['signal']
                     score  = best['total_score']
                     reason = best.get('reason', '')[:100]
+
+                    # Fetch OHLCV for entry model analysis
+                    df = client.fetch_ohlcv(symbol, TF, limit=100)
+                    if df is None or df.empty or len(df) < 30:
+                        push_log(f"[#{cycle}] SKIPPED {symbol}: Insufficient data")
+                        time.sleep(2)
+                        continue
+
+                    # Add indicators for analysis
+                    df = scanner._add_indicators(df)
+
+                    # Run custom entry models
+                    liq_grab = scanner._detect_liquidity_grab(df)
+                    breakout = scanner._detect_breakout_retest(df)
+                    momentum = scanner._detect_momentum_ignition(df)
+
+                    # Pick highest confidence model
+                    models = [liq_grab, breakout, momentum]
+                    best_model = max(models, key=lambda x: x['confidence'])
+
+                    if best_model['confidence'] < 0.65:
+                        push_log(f"[#{cycle}] SKIPPED {symbol}: No strong setup (best: {best_model['confidence']:.2f})")
+                        time.sleep(2)
+                        continue
+
+                    # Order flow confirmation
+                    orderflow = order_analyzer.analyze_orderbook_imbalance(symbol)
+                    fake_breakout = order_analyzer.detect_fake_breakout(df)
+
+                    if fake_breakout:
+                        push_log(f"[{symbol}] FAKE BREAKOUT detected - skipping")
+                        time.sleep(2)
+                        continue
+
+                    # ML prediction filter
+                    latest = df.iloc[-1]
+                    ml_features = {
+                        'trend_strength': best.get('trend', 0) / 30.0,
+                        'volume_ratio': best.get('volume', 0) / 25.0,
+                        'volatility': scanner._estimate_atr_pct(df),
+                        'rsi': latest.get('rsi', 50),
+                        'btc_direction': 0
+                    }
+
+                    ml_confidence = ml_predictor.predict_win_probability(ml_features)
+
+                    if ml_confidence < 0.55:
+                        push_log(f"[{symbol}] ML filter blocked (confidence {ml_confidence:.1%})")
+                        time.sleep(2)
+                        continue
+
+                    # Final decision: execute if combined confidence high
+                    combined_confidence = (best_model['confidence'] + ml_confidence) / 2
+                    if combined_confidence < 0.60:
+                        push_log(f"[{symbol}] Combined confidence too low ({combined_confidence:.1%})")
+                        time.sleep(2)
+                        continue
 
                     # AI filtering: check symbol tradeability
                     tradeable, ai_reason = ai_engine.is_symbol_tradeable(symbol)
@@ -286,23 +338,25 @@ def trading_loop():
 
                     # BTC correlation check
                     btc_df = scanner._get_btc_df()
+                    btc_direction = 0
                     if btc_df is not None and len(btc_df) >= 6:
                         btc_change = (btc_df.iloc[-1]['close'] - btc_df.iloc[-6]['close']) / btc_df.iloc[-6]['close'] * 100
                         btc_trend = 'bullish' if btc_change > 0.3 else ('bearish' if btc_change < -0.3 else 'neutral')
+                        btc_direction = btc_change / 100  # Normalize to -1 to 1 range
                         corr_ok, corr_reason = ai_engine.get_btc_correlation_advice(symbol, btc_trend)
                         if not corr_ok:
                             push_log(f"[#{cycle}] Correlation warning: {corr_reason}")
                             time.sleep(2)
                             continue
 
-                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} score={score}/100 | AI: {ai_reason}")
-                    push_log(f"  Reason: {reason}")
+                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} | Model: {best_model['reason']}")
+                    push_log(f"  Orderflow: {orderflow['bias']} ({orderflow['imbalance']}) | ML: {ml_confidence:.1%} | Combined: {combined_confidence:.1%}")
                     state['active_pair']  = symbol
                     state['last_signal']  = best
 
-                    _execute_trade(side, score, symbol)
+                    _execute_trade(side, int(combined_confidence * 100), symbol)
                 else:
-                    push_log(f"[#{cycle}] No qualifying setups (need {MIN_SCORE}+/100). Waiting...")
+                    push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
             else:
                 push_log(f"[#{cycle}] Max positions ({MAX_POSITIONS}) reached. Managing open trades...")
