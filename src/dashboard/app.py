@@ -1,6 +1,8 @@
 """
-KuCoin Trading Bot - Integrated Dashboard + Trading Engine
-Supports multiple pairs: XBTUSDTM (BTC) + SIRENUSDTM (SIREN)
+KuCoin Smart Scanner Bot
+Scans 20 KuCoin Futures pairs every cycle.
+Only trades when confidence >= 7/10.
+5-minute chart. One open position at a time.
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -17,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from src.api.kucoin_client import KuCoinClient
 from src.strategy.trend_following import TrendFollowingStrategy
+from src.strategy.market_scanner import MarketScanner, CONTRACT_SIZE
 from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
 from src.learning.compounding_engine import CompoundingEngine
@@ -37,57 +40,39 @@ CONFIG_PATH = os.path.join(
 with open(CONFIG_PATH, 'r') as f:
     CONFIG = yaml.safe_load(f)
 
-PRIMARY_SYMBOL = CONFIG.get('symbol', 'XBTUSDTM')
 TF             = CONFIG.get('timeframe', '5m')
-INTERVAL       = CONFIG.get('check_interval', 10)
-
-# Get all pairs from config
-multi_cfg = CONFIG.get('multi_pair_trading', {})
-ALL_PAIRS = multi_cfg.get('pairs', [PRIMARY_SYMBOL]) if multi_cfg.get('enabled', False) else [PRIMARY_SYMBOL]
-
-# Contract sizes per symbol (contracts per unit)
-# XBTUSDTM: 1 contract = 0.001 BTC
-# SIRENUSDTM: 1 contract = 10 SIREN
-CONTRACT_SIZE = {
-    'XBTUSDTM':  0.001,
-    'SIRENUSDTM': 10.0,
-    'ETHUSDTM':  0.01,
-    'SOLUSDTM':  1.0,
-    'XRPUSDTM':  10.0,
-}
+INTERVAL       = CONFIG.get('check_interval', 15)
+MIN_SCORE      = CONFIG.get('scanner_min_score', 7)
 
 # ── Shared state ──────────────────────────────────────────────
 state = {
-    'is_running':    False,
-    'ticker':        {},
-    'candles':       [],
-    'siren_candles': [],
-    'position':      None,
-    'last_signal':   {'signal': 'none', 'strength': 0, 'reason': ''},
-    'performance':   {},
-    'recent_trades': [],
-    'log_feed':      [],
-    'cycle':         0,
-    'last_update':   '',
-    'pairs':         ALL_PAIRS,
-    'active_pair':   PRIMARY_SYMBOL,
-    'compounding':   {},
+    'is_running':      False,
+    'ticker':          {},
+    'candles':         [],
+    'position':        None,
+    'last_signal':     {'signal': 'none', 'strength': 0, 'reason': ''},
+    'performance':     {},
+    'recent_trades':   [],
+    'log_feed':        [],
+    'cycle':           0,
+    'last_update':     '',
+    'active_pair':     'Scanning...',
+    'compounding':     {},
+    'scanner_results': [],   # Latest scan scores for all pairs
     'trade_open_time': None,
+    'current_symbol':  None, # Symbol of current open trade
 }
 
 # ── Components ────────────────────────────────────────────────
-client   = KuCoinClient()
-journal  = TradeJournal(db_path=CONFIG.get('journal_db_path', 'trading_journal.db'))
-strategy = TrendFollowingStrategy(CONFIG)
-risk_mgr = AdvancedRiskManager(CONFIG)
-risk_mgr.trade_history = []  # Fresh start
-risk_mgr.daily_pnl = 0.0
-intel = MarketIntelligence(client)
-# Compounding engine - $20 base trade, compound from wins
-compounder = CompoundingEngine(
-    starting_balance = 45.0,
-    risk_pct         = 20.0,   # 20% compound growth per win
-)
+client     = KuCoinClient()
+journal    = TradeJournal(db_path=CONFIG.get('journal_db_path', 'trading_journal.db'))
+strategy   = TrendFollowingStrategy(CONFIG)
+risk_mgr   = AdvancedRiskManager(CONFIG)
+risk_mgr.trade_history = []
+risk_mgr.daily_pnl     = 0.0
+intel      = MarketIntelligence(client)
+compounder = CompoundingEngine(starting_balance=45.0, risk_pct=20.0)
+scanner    = MarketScanner(client, strategy, intel, timeframe=TF)
 
 bot_thread    = None
 market_thread = None
@@ -99,14 +84,13 @@ market_thread = None
 def push_log(msg: str):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     state['log_feed'].append(line)
-    if len(state['log_feed']) > 100:
-        state['log_feed'] = state['log_feed'][-100:]
+    if len(state['log_feed']) > 150:
+        state['log_feed'] = state['log_feed'][-150:]
     socketio.emit('log', {'line': line})
     logger.info(msg)
 
 
 def df_to_candles(df):
-    """Convert OHLCV dataframe to list of dicts for chart."""
     rows = []
     for _, r in df.iterrows():
         ts = r['timestamp']
@@ -126,7 +110,6 @@ def df_to_candles(df):
 
 
 def get_contracts(symbol: str, margin_usd: float, leverage: int, price: float) -> int:
-    """Calculate number of contracts based on margin and contract size."""
     contract_size = CONTRACT_SIZE.get(symbol, 0.001)
     position_usd  = margin_usd * leverage
     contracts     = position_usd / (price * contract_size)
@@ -134,40 +117,37 @@ def get_contracts(symbol: str, margin_usd: float, leverage: int, price: float) -
 
 
 def update_performance():
-    all_trades = []
-    for sym in ALL_PAIRS:
-        trades = journal.get_recent_trades(sym, limit=10)
-        all_trades.extend(trades)
-    all_trades.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    state['recent_trades'] = all_trades[:20]
-    # Performance from primary pair
-    state['performance'] = journal.get_trade_statistics(PRIMARY_SYMBOL)
-    state['compounding'] = compounder.get_stats()
-    # Add intelligence status
-    state['intelligence'] = {
+    # Collect recent trades from journal (all pairs)
+    all_trades = journal.get_recent_trades(limit=20)
+    state['recent_trades'] = all_trades
+    state['performance']   = journal.get_trade_statistics()
+    state['compounding']   = compounder.get_stats()
+    state['scanner_results'] = scanner.get_watchlist_status()
+    state['intelligence']  = {
         'flash_crash_cooldown': intel.flash_crash_cooldown,
-        'funding_cache': {k: {'rate_pct': round(v.get('rate', 0) * 100, 4), 'direction': v.get('direction', 'neutral')} for k, v in intel.funding_cache.items()},
-        'orderbook': {k: {'bias': v.get('bias', 'neutral'), 'bid_pct': round(v.get('bid_pct', 0.5) * 100, 1)} for k, v in intel.last_orderbook.items()},
+        'consecutive_losses':  intel.consecutive_losses,
+        'session':             intel.get_session_info().get('session', 'unknown'),
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  MARKET DATA THREAD
+#  MARKET DATA THREAD (charts + positions)
 # ─────────────────────────────────────────────────────────────
 
 def market_loop():
-    """Always-running thread: fetches prices + charts for ALL pairs."""
-    logger.info(f"Market loop started for pairs: {ALL_PAIRS}")
+    logger.info("Market data loop started")
     while True:
         try:
-            # ── BTC / primary pair ──
-            df_btc = client.fetch_ohlcv(PRIMARY_SYMBOL, TF, limit=100)
-            if df_btc is not None and not df_btc.empty:
-                state['candles'] = df_to_candles(df_btc)
+            # Show chart for active symbol (or BTC if none)
+            active = state.get('current_symbol') or 'XBTUSDTM'
+            df = client.fetch_ohlcv(active, TF, limit=100)
+            if df is not None and not df.empty:
+                state['candles'] = df_to_candles(df)
 
-            ticker = client.fetch_ticker(PRIMARY_SYMBOL)
+            ticker = client.fetch_ticker(active)
             if ticker:
                 state['ticker'] = {
+                    'symbol': active,
                     'price':  ticker.get('last', 0),
                     'change': ticker.get('percentage', 0),
                     'high':   ticker.get('high', 0),
@@ -175,25 +155,12 @@ def market_loop():
                     'volume': ticker.get('baseVolume', 0),
                 }
 
-            # ── SIREN (if in pairs) ──
-            if 'SIRENUSDTM' in ALL_PAIRS:
-                df_siren = client.fetch_ohlcv('SIRENUSDTM', TF, limit=100)
-                if df_siren is not None and not df_siren.empty:
-                    state['siren_candles'] = df_to_candles(df_siren)
-                    # Add SIREN ticker to state
-                    t_siren = client.fetch_ticker('SIRENUSDTM')
-                    if t_siren:
-                        state['siren_ticker'] = {
-                            'price':  t_siren.get('last', 0),
-                            'change': t_siren.get('percentage', 0),
-                        }
-
-            # ── Position ──
-            for sym in ALL_PAIRS:
-                pos = client.fetch_position(sym)
+            # Check open position
+            if state.get('current_symbol'):
+                pos = client.fetch_position(state['current_symbol'])
                 if pos and float(pos.get('contracts', 0) or 0) != 0:
                     state['position'] = {
-                        'symbol':         sym,
+                        'symbol':         state['current_symbol'],
                         'side':           'long' if float(pos.get('contracts', 0)) > 0 else 'short',
                         'size':           pos.get('contracts', 0),
                         'entry_price':    pos.get('entryPrice', 0),
@@ -201,7 +168,8 @@ def market_loop():
                         'unrealized_pnl': pos.get('unrealizedPnl', 0),
                         'leverage':       pos.get('leverage', 10),
                     }
-                    break
+                else:
+                    state['position'] = None
             else:
                 state['position'] = None
 
@@ -216,110 +184,81 @@ def market_loop():
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRADING ENGINE THREAD
+#  TRADING ENGINE - SCANNER DRIVEN
 # ─────────────────────────────────────────────────────────────
 
 def trading_loop():
-    """Scans ALL pairs every cycle for trade signals."""
-    push_log(f"Trading engine started | Pairs: {', '.join(ALL_PAIRS)}")
-    push_log(f"Interval: {INTERVAL}s | Min signal: {CONFIG.get('min_signal_strength',5)}/10")
-    push_log(f"Pairs loaded from config: {ALL_PAIRS}")
-    push_log(f"Multi-pair enabled: {CONFIG.get('multi_pair_trading', {}).get('enabled', False)}")
-    for p in ALL_PAIRS:
-        from src.api.kucoin_client import to_ccxt_symbol
-        push_log(f"  {p} -> {to_ccxt_symbol(p)} (ccxt symbol)")
+    push_log(f"Scanner Bot started | TF:{TF} | Min score:{MIN_SCORE}/10 | Scanning {len(scanner.WATCHLIST)} pairs")
+    push_log("Will scan all pairs and only trade when confidence >= 7/10")
 
     while state['is_running']:
         try:
             state['cycle'] += 1
             cycle = state['cycle']
 
-            for symbol in ALL_PAIRS:
-                if not state['is_running']:
-                    break
-                try:
-                    df = client.fetch_ohlcv(symbol, TF, limit=100)
-                    if df is None or df.empty:
-                        push_log(f"[{symbol}] No data - check Railway logs for KuCoin error")
-                        time.sleep(5)
-                        continue
+            # ── MANAGE EXISTING POSITION ────────────────────
+            current_sym = state.get('current_symbol')
+            if current_sym and risk_mgr.open_position:
+                ticker = client.fetch_ticker(current_sym)
+                if ticker:
+                    price = float(ticker.get('last', 0))
+                    risk_mgr.update_position_tracking(price)
+                    risk_mgr.update_trailing_stop(price, risk_mgr.open_position.get('side', 'buy'))
 
-                    # Get base signal from strategy
-                    signal = strategy.analyze(df)
-                    
-                    # Apply Market Intelligence (order book, funding, correlation, flash crash)
-                    try:
-                        btc_df = None
-                        if symbol != 'XBTUSDTM':
-                            btc_df = client.fetch_ohlcv('XBTUSDTM', TF, limit=100)
-                        signal = intel.get_trade_intelligence(
-                            symbol=symbol,
-                            signal=signal,
-                            btc_df=btc_df,
-                            alt_df=df
-                        )
-                    except Exception as ie:
-                        push_log(f"[{symbol}] Intel error: {str(ie)[:50]}")
-                    
-                    sig    = signal.get('signal', 'hold')
-                    str_   = signal.get('strength', 0)
-                    reason = signal.get('reason', '')[:120]
+                    if risk_mgr.check_stop_loss_triggered(price):
+                        push_log(f"[{current_sym}] STOP LOSS @ {price:.6f}")
+                        _close_trade(price, 'stop_loss', current_sym)
 
-                    if symbol == ALL_PAIRS[0]:
-                        state['last_signal'] = signal
+                    elif risk_mgr.check_take_profit_triggered(price):
+                        push_log(f"[{current_sym}] TAKE PROFIT @ {price:.6f}")
+                        _close_trade(price, 'take_profit', current_sym)
 
-                    push_log(f"[{symbol}] #{cycle} {sig.upper()} ({str_}/10) | {reason}")
+                    elif state.get('trade_open_time'):
+                        hold_secs = time.time() - state['trade_open_time']
+                        max_hold  = CONFIG.get('max_hold_time_minutes', 15) * 60
+                        if hold_secs >= max_hold:
+                            push_log(f"[{current_sym}] MAX HOLD ({hold_secs/60:.1f}min) - closing")
+                            _close_trade(price, 'max_hold_time', current_sym)
 
-                    # Check existing position
-                    pos = client.fetch_position(symbol)
-                    in_pos = pos and float(pos.get('contracts', 0) or 0) != 0
+                    else:
+                        push_log(f"[{current_sym}] IN POSITION @ {price:.6f} | PnL: {risk_mgr.open_position.get('unrealized_pnl', 0):.4f}")
 
-                    if in_pos and risk_mgr.open_position:
-                        ticker = client.fetch_ticker(symbol)
-                        if ticker:
-                            price = float(ticker.get('last', 0))
-                            risk_mgr.update_position_tracking(price)
-                            risk_mgr.update_trailing_stop(price, risk_mgr.open_position.get('side','buy'))
-                            if risk_mgr.check_stop_loss_triggered(price):
-                                push_log(f"[{symbol}] STOP LOSS @ {price:.5f}")
-                                _close_trade(price, 'stop_loss', symbol)
-                                in_pos = False
-                            elif risk_mgr.check_take_profit_triggered(price):
-                                push_log(f"[{symbol}] TAKE PROFIT @ {price:.5f}")
-                                _close_trade(price, 'take_profit', symbol)
-                                in_pos = False
-                            # Auto-exit after max hold time (micro-scalp: 3 min)
-                            elif state.get('trade_open_time'):
-                                hold_secs = time.time() - state['trade_open_time']
-                                max_hold = CONFIG.get('max_hold_time_minutes', 3) * 60
-                                if hold_secs >= max_hold:
-                                    push_log(f"[{symbol}] MAX HOLD TIME ({hold_secs:.0f}s) - auto closing")
-                                    _close_trade(price, 'max_hold_time', symbol)
-                                    in_pos = False
-                                    state['trade_open_time'] = None
+                time.sleep(INTERVAL)
+                continue
 
-                    if not in_pos and sig in ('buy', 'sell'):
-                        min_str = CONFIG.get('min_signal_strength', 5)
-                        if str_ >= min_str:
-                            _execute_trade(sig, str_, symbol)
-                        else:
-                            push_log(f"[{symbol}] Weak signal ({str_}<{min_str}), skip")
+            # ── SCAN MARKET FOR BEST OPPORTUNITY ────────────
+            push_log(f"[#{cycle}] Scanning {len(scanner.WATCHLIST)} pairs for opportunities...")
+            state['active_pair'] = 'Scanning...'
 
-                except Exception as e:
-                    push_log(f"[{symbol}] Error: {str(e)[:80]}")
-                    logger.error(f"[{symbol}] error: {e}", exc_info=True)
+            best = scanner.get_best_opportunity(exclude_symbols=[current_sym] if current_sym else [])
 
-                time.sleep(1)
+            if best and best.get('tradeable'):
+                symbol = best['symbol']
+                side   = best['side']
+                score  = best['score']
+                reason = best.get('reason', '')[:100]
+
+                push_log(f"[#{cycle}] BEST: {symbol} {side.upper()} score={score}/10")
+                push_log(f"  Reason: {reason}")
+                state['active_pair']  = symbol
+                state['last_signal']  = best.get('signal', {})
+
+                _execute_trade(side, score, symbol)
+
+            else:
+                push_log(f"[#{cycle}] No high-confidence setup found. Waiting...")
+                state['active_pair'] = 'Waiting for setup...'
 
         except Exception as e:
             push_log(f"Loop error: {str(e)[:80]}")
+            logger.error(f"Trading loop error: {e}", exc_info=True)
+
         time.sleep(INTERVAL)
 
     push_log("Trading engine stopped")
 
 
 def _execute_trade(side: str, strength: int, symbol: str):
-    """Execute market order for given symbol."""
     try:
         ticker = client.fetch_ticker(symbol)
         if not ticker:
@@ -327,7 +266,7 @@ def _execute_trade(side: str, strength: int, symbol: str):
             return
         price = float(ticker.get('last', 0))
         if price <= 0:
-            push_log(f"[{symbol}] Bad price: {price}")
+            push_log(f"[{symbol}] Bad price")
             return
 
         bal = client.fetch_balance()
@@ -336,58 +275,63 @@ def _execute_trade(side: str, strength: int, symbol: str):
             return
         usdt = float(bal.get('USDT', {}).get('free', 0) or 0)
         push_log(f"[{symbol}] Balance: ${usdt:.2f}")
-        if usdt < 3:
+        if usdt < 5:
             push_log(f"[{symbol}] Balance too low (${usdt:.2f})")
             return
 
-        leverage   = CONFIG.get('leverage', 10)
-        # Use compounding engine for position sizing (grows with balance)
+        leverage = CONFIG.get('leverage', 10)
         compounder.update_balance(usdt)
         margin_usd = max(compounder.get_position_size_usd(), 1.0)
-        
-        # Apply loss limiter multiplier (reduces size after consecutive losses)
+
+        # Apply loss limiter
         loss_check = intel.check_loss_limit()
         if loss_check['position_multiplier'] < 1.0:
             margin_usd = margin_usd * loss_check['position_multiplier']
-            push_log(f"[{symbol}] Position reduced: {loss_check['reason']}")
-        
-        contracts  = get_contracts(symbol, margin_usd, leverage, price)
+            push_log(f"[{symbol}] Size reduced: {loss_check['reason']}")
 
-        sl_pct = CONFIG.get('stop_loss_percent', 0.2) / 100
-        tp_pct = CONFIG.get('take_profit_percent', 0.6) / 100
-        sl = round(price * (1 - sl_pct if side=='buy' else 1 + sl_pct), 6)
-        tp = round(price * (1 + tp_pct if side=='buy' else 1 - tp_pct), 6)
+        # Cap margin at available balance
+        margin_usd = min(margin_usd, usdt * 0.5)
 
-        push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.5f} | SL:{sl:.5f} TP:{tp:.5f}")
+        contracts = get_contracts(symbol, margin_usd, leverage, price)
+
+        sl_pct = CONFIG.get('stop_loss_percent', 0.3) / 100
+        tp_pct = CONFIG.get('take_profit_percent', 0.5) / 100
+        sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
+        tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)
+
+        push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.6f} | margin=${margin_usd:.2f} | SL:{sl:.6f} TP:{tp:.6f}")
 
         order = client.create_order(symbol=symbol, order_type='market', side=side, amount=contracts)
         if order:
-            push_log(f"[{symbol}] Order filled! ID:{order.get('id','?')}")
+            push_log(f"[{symbol}] ORDER FILLED! ID:{order.get('id','?')}")
             risk_mgr.open_trade({
                 'symbol': symbol, 'side': side, 'entry_price': price,
                 'quantity': contracts, 'leverage': leverage,
                 'stop_loss': sl, 'take_profit': tp, 'signal_strength': strength,
             })
             state['trade_open_time'] = time.time()
+            state['current_symbol']  = symbol
         else:
-            push_log(f"[{symbol}] Order failed - check terminal for KuCoin error")
+            push_log(f"[{symbol}] Order FAILED")
 
     except Exception as e:
-        push_log(f"[{symbol}] Trade error: {str(e)[:100]}")
+        push_log(f"[{symbol}] Execute error: {str(e)[:100]}")
         logger.error(f"Execute trade error: {e}", exc_info=True)
 
 
 def _close_trade(exit_price: float, reason: str, symbol: str):
-    """Close open position for symbol."""
     try:
         if not risk_mgr.open_position:
             return
         side       = risk_mgr.open_position['side']
         qty        = abs(risk_mgr.open_position['quantity'])
         close_side = 'sell' if side == 'buy' else 'buy'
-        order = client.create_order(symbol=symbol, order_type='market',
-                                    side=close_side, amount=qty,
-                                    params={'reduceOnly': True})
+
+        order = client.create_order(
+            symbol=symbol, order_type='market',
+            side=close_side, amount=qty,
+            params={'reduceOnly': True}
+        )
         if order:
             result = risk_mgr.close_trade(exit_price, reason)
             if result:
@@ -395,11 +339,14 @@ def _close_trade(exit_price: float, reason: str, symbol: str):
                 pnl = result.get('pnl', 0)
                 compounder.record_trade(pnl, side, symbol)
                 intel.record_trade_result(won=(pnl >= 0))
-                tag = 'WIN' if pnl >= 0 else 'LOSS'
-                state['trade_open_time'] = None
+                tag = 'WIN ✓' if pnl >= 0 else 'LOSS ✗'
                 push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
         else:
             push_log(f"[{symbol}] CLOSE FAILED!")
+
+        state['trade_open_time'] = None
+        state['current_symbol']  = None
+
     except Exception as e:
         push_log(f"[{symbol}] Close error: {str(e)[:100]}")
         logger.error(f"Close trade error: {e}", exc_info=True)
@@ -419,11 +366,15 @@ def api_state():
 
 @app.route('/api/trades')
 def api_trades():
-    return jsonify(journal.get_recent_trades(PRIMARY_SYMBOL, limit=50))
+    return jsonify(journal.get_recent_trades(limit=50))
 
 @app.route('/api/performance')
 def api_performance():
-    return jsonify(journal.get_trade_statistics(PRIMARY_SYMBOL))
+    return jsonify(journal.get_trade_statistics())
+
+@app.route('/api/scanner')
+def api_scanner():
+    return jsonify(scanner.get_watchlist_status())
 
 @socketio.on('connect')
 def on_connect():
@@ -458,7 +409,7 @@ def start():
     port = int(os.environ.get('PORT', 5000))
     market_thread = threading.Thread(target=market_loop, daemon=True)
     market_thread.start()
-    logger.info(f"Dashboard on port {port} | Pairs: {ALL_PAIRS}")
+    logger.info(f"Smart Scanner Bot on port {port} | Scanning {len(scanner.WATCHLIST)} pairs | TF:{TF}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
 
 

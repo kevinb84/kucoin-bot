@@ -98,18 +98,25 @@ class TradeJournal:
         conn.commit()
         conn.close()
     
-    def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get recent trades for a symbol."""
+    def get_recent_trades(self, symbol: str = None, limit: int = 100) -> List[Dict]:
+        """Get recent trades. If symbol is None, returns all pairs."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT * FROM trades 
-            WHERE symbol = ? 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        ''', (symbol, limit))
+        if symbol:
+            cursor.execute('''
+                SELECT * FROM trades 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (symbol, limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM trades 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (limit,))
         
         trades = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -149,25 +156,40 @@ class TradeJournal:
         conn.close()
         return trades
     
-    def get_trade_statistics(self, symbol: str) -> Dict:
-        """Calculate basic trade statistics."""
+    def get_trade_statistics(self, symbol: str = None) -> Dict:
+        """Calculate trade statistics. If symbol is None, stats across all pairs."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
-                AVG(pnl) as avg_pnl,
-                SUM(pnl) as total_pnl,
-                AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
-                AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END) as avg_loss,
-                MAX(pnl) as max_win,
-                MIN(pnl) as max_loss
-            FROM trades
-            WHERE symbol = ?
-        ''', (symbol,))
+        if symbol:
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
+                    AVG(pnl) as avg_pnl,
+                    SUM(pnl) as total_pnl,
+                    AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
+                    AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END) as avg_loss,
+                    MAX(pnl) as max_win,
+                    MIN(pnl) as max_loss
+                FROM trades
+                WHERE symbol = ?
+            ''', (symbol,))
+        else:
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
+                    AVG(pnl) as avg_pnl,
+                    SUM(pnl) as total_pnl,
+                    AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
+                    AVG(CASE WHEN pnl <= 0 THEN pnl ELSE NULL END) as avg_loss,
+                    MAX(pnl) as max_win,
+                    MIN(pnl) as max_loss
+                FROM trades
+            ''')
         
         row = cursor.fetchone()
         conn.close()

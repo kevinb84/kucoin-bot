@@ -1,69 +1,94 @@
-# KuCoin Micro-Scalping Bot - $0.80 per trade, 1 trade per minute
+# KuCoin Smart Scanner Bot - Finds best opportunities across ALL futures pairs
+# Scans 20 pairs, only trades when confidence >= 7/10
 # Balance: ~$45 | Leverage: 10x | $20 margin = $200 position
-# Math: $200 position × 0.4% move = $0.80 profit per trade
+# Math: $200 position × 0.5% move = $1.00 profit per win
 
-# ===== API (set via Railway env vars) =====
+# ===== API =====
 api_key: ""
 api_secret: ""
 api_passphrase: ""
 
-# ===== Trading - 1 MINUTE MICRO SCALPING =====
-symbol: "SIRENUSDTM"
-timeframe: "1m"
-check_interval: 8           # Check every 8 seconds (fast cycle)
+# ===== Trading - 5 MINUTE CHART =====
+symbol: "XBTUSDTM"       # Fallback symbol if scanner finds nothing
+timeframe: "5m"
+check_interval: 15        # Scanner runs every 15 seconds
 leverage: 10
 
-# ===== Risk Management - Micro Scalp =====
-# $20 margin × 10x = $200 position
-# TP: 0.4% of $200 = $0.80 profit per win
-# SL: 0.35% of $200 = $0.70 max loss (wider than noise on 1-min SIREN)
-max_position_size: 25        # $25 max margin
-risk_per_trade: 20.0
-stop_loss_percent: 0.35      # 0.35% stop = $0.70 max loss (avoids wick noise)
-take_profit_percent: 0.4     # 0.4% TP = $0.80 profit per win
-trailing_stop: false         # No trailing for micro scalps (too tight)
-trailing_stop_distance: 0.1
-max_daily_loss: 10.0
-max_drawdown: 15.0
-max_hold_time_minutes: 3     # Exit after 3 min if no TP/SL hit
+# ===== Scanner Settings =====
+scanner_enabled: true
+scanner_min_score: 7      # Only trade pairs with score >= 7/10
+scanner_max_open: 1       # Max 1 open position at a time
+scanner_interval: 60      # Re-scan all pairs every 60 seconds
 
-# ===== Strategy - FAST for 1-min chart =====
-ema_fast: 3                  # 3-candle EMA (very fast)
-ema_slow: 8                  # 8-candle EMA
-ema_signal_threshold: 0.02   # Tiny threshold = more signals
-min_signal_strength: 4       # Lower bar = trade more often
-rsi_period: 7                # 7-period RSI (faster)
+# ===== Risk Management =====
+# $20 margin × 10x = $200 position
+# TP: 0.5% = $1.00 profit per win
+# SL: 0.3% = $0.60 max loss  → 1.67:1 reward/risk
+max_position_size: 25
+risk_per_trade: 20.0
+stop_loss_percent: 0.3    # 0.3% SL = $0.60 max loss
+take_profit_percent: 0.5  # 0.5% TP = $1.00 profit per win
+trailing_stop: true
+trailing_stop_distance: 0.2
+max_daily_loss: 15.0
+max_drawdown: 20.0
+max_hold_time_minutes: 15  # Exit after 15 min if no TP/SL
+
+# ===== Strategy - 5-min optimized =====
+ema_fast: 7
+ema_slow: 21
+ema_signal_threshold: 0.1
+min_signal_strength: 7     # Only trade 7+ strength signals
+rsi_period: 14
 rsi_overbought: 65
 rsi_oversold: 35
 rsi_extreme_overbought: 80
 rsi_extreme_oversold: 20
 
-# ===== Filters - RELAXED for frequent trades =====
-confirm_with_higher_tf: false  # Don't wait for higher TF (too slow)
-volume_threshold: 1.0          # No volume filter (trade fast)
-exit_on_opposite_signal: true  # Exit on reversal
-max_hold_time_minutes: 3       # Max 3 min hold
+# ===== Filters =====
+confirm_with_higher_tf: true
+volume_threshold: 1.2
+exit_on_opposite_signal: true
 
-# ===== Multi-Pair Trading =====
+# ===== Multi-Pair (managed by scanner) =====
 multi_pair_trading:
   enabled: true
   pairs:
-    - "SIRENUSDTM"
+    - "XBTUSDTM"
+    - "ETHUSDTM"
+    - "SOLUSDTM"
+    - "XRPUSDTM"
+    - "DOGEUSDTM"
+    - "ADAUSDTM"
+    - "AVAXUSDTM"
+    - "LINKUSDTM"
+    - "BNBUSDTM"
+    - "LTCUSDTM"
+    - "DOTUSDTM"
+    - "BCHUHDTM"
+    - "UNIUSDTM"
+    - "ATOMUSDTM"
+    - "NEARUSDTM"
+    - "MATICUSDTM"
+    - "AAVEUSDTM"
+    - "FILUSDTM"
+    - "TRXUSDTM"
+    - "ETCUSDTM"
 
 # ===== Self-Learning =====
 learning_enabled: true
-optimization_interval: 50
-min_trades_for_optimization: 20
+optimization_interval: 30
+min_trades_for_optimization: 10
 parameter_auto_tune: true
 performance_tracking: true
 
 # ===== ML =====
-ml_enabled: false             # Disable ML for speed (1-min needs fast decisions)
+ml_enabled: false
 
 # ===== Market Regime =====
 regime_detection: true
-volatility_lookback: 20
-trend_strength_threshold: 0.3
+volatility_lookback: 30
+trend_strength_threshold: 0.4
 
 # ===== Logging =====
 log_level: "INFO"
