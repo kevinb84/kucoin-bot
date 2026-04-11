@@ -309,6 +309,28 @@ class AdvancedMarketScanner:
         
         return {'signal': 'hold', 'confidence': 0, 'reason': 'No momentum spike'}
 
+    def _micro_confirm_entry(self, df, signal: str) -> bool:
+        """
+        Wait for confirmation candle before entering.
+        Reduces false entries from liquidity grabs/breakouts.
+        """
+        if len(df) < 3:
+            return False
+        
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        if signal == 'buy':
+            if latest['close'] > latest['open'] and latest['close'] > prev['high']:
+                if latest['volume'] > prev['volume']:
+                    return True
+        elif signal == 'sell':
+            if latest['close'] < latest['open'] and latest['close'] < prev['low']:
+                if latest['volume'] > prev['volume']:
+                    return True
+        
+        return False
+
     def score_pair(self, symbol: str, df: pd.DataFrame) -> Dict:
         """
         Score a trading pair using THREE dedicated entry models:

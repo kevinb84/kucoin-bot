@@ -671,23 +671,20 @@ class AdaptiveIntelligenceEngine:
 
     def get_learning_summary(self) -> Dict:
         """Get concise summary of learning state for dashboard display."""
-        # Top strategies
         top_strats = self.get_best_strategies(limit=3)
 
-        # Preferred symbols
         preferred_syms = self.get_preferred_symbols(limit=5)
 
-        # Blacklisted symbols count
         blacklisted_count = sum(1 for s in self.symbol_performance.values() if s.get('blacklisted', False))
 
-        # Current regime
         regime = self.current_regime
 
-        # Recent win rate
         if self.recent_trades:
             recent_wr = sum(1 for t in self.recent_trades[-20:] if t['won']) / min(len(self.recent_trades), 20)
         else:
             recent_wr = 0
+
+        edge_scores = self.get_edge_quality_scores()
 
         return {
             'top_strategies': top_strats,
@@ -696,4 +693,20 @@ class AdaptiveIntelligenceEngine:
             'current_regime': regime,
             'recent_win_rate': recent_wr,
             'total_trades_tracked': len(self.recent_trades),
+            'edge_quality_scores': edge_scores,
         }
+
+    def get_edge_quality_scores(self) -> Dict[str, float]:
+        """
+        Calculate edge score = total_profit / total_trades for each strategy.
+        Returns dict of strategy -> edge score.
+        """
+        edge_scores = {}
+
+        for strat_name, perf in self.strategy_performance.items():
+            if perf['trades'] > 0:
+                edge_scores[strat_name] = perf['total_pnl'] / perf['trades']
+            else:
+                edge_scores[strat_name] = 0.0
+
+        return edge_scores

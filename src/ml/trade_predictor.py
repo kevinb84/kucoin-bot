@@ -25,11 +25,12 @@ class TradePredictor:
     def predict_win_probability(self, features: Dict) -> float:
         """
         Predict probability of trade success.
-        Features: trend_strength (0-1), volume_ratio, volatility, rsi (0-100), btc_direction (-1 to 1)
+        Features: trend_strength, volume_ratio, volatility, rsi, btc_direction,
+                  orderbook_imbalance, distance_from_liquidity, breakout_strength, candle_momentum
         Returns: 0.0 to 1.0
         """
         if self.model is None:
-            return 0.5  # Default if no model trained yet
+            return 0.5
         
         try:
             feature_array = np.array([[
@@ -37,7 +38,11 @@ class TradePredictor:
                 features.get('volume_ratio', 1.0),
                 features.get('volatility', 1.0),
                 features.get('rsi', 50) / 100.0,
-                features.get('btc_direction', 0)
+                features.get('btc_direction', 0),
+                features.get('orderbook_imbalance', 0),
+                features.get('distance_from_liquidity', 0.5),
+                features.get('breakout_strength', 0.5),
+                features.get('candle_momentum', 0.5)
             ]])
             
             probability = self.model.predict_proba(feature_array)[0][1]
@@ -67,7 +72,11 @@ class TradePredictor:
                 features.get('volume_ratio', 1.0),
                 features.get('volatility', 1.0),
                 features.get('rsi', 50) / 100.0,
-                features.get('btc_direction', 0)
+                features.get('btc_direction', 0),
+                features.get('orderbook_imbalance', 0),
+                features.get('distance_from_liquidity', 0.5),
+                features.get('breakout_strength', 0.5),
+                features.get('candle_momentum', 0.5)
             ])
             y.append(1 if trade.get('won', False) else 0)
         

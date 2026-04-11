@@ -274,7 +274,7 @@ def trading_loop():
                     # Add indicators for analysis
                     df = scanner._add_indicators(df)
 
-                    # Run custom entry models
+                    # Run all 3 entry models
                     liq_grab = scanner._detect_liquidity_grab(df)
                     breakout = scanner._detect_breakout_retest(df)
                     momentum = scanner._detect_momentum_ignition(df)
@@ -283,43 +283,46 @@ def trading_loop():
                     models = [liq_grab, breakout, momentum]
                     best_model = max(models, key=lambda x: x['confidence'])
 
-                    if best_model['confidence'] < 0.65:
-                        push_log(f"[#{cycle}] SKIPPED {symbol}: No strong setup (best: {best_model['confidence']:.2f})")
-                        time.sleep(2)
-                        continue
+                    model_confidence = best_model['confidence']
 
-                    # Order flow confirmation
+                    # Order flow analysis
                     orderflow = order_analyzer.analyze_orderbook_imbalance(symbol)
-                    fake_breakout = order_analyzer.detect_fake_breakout(df)
+                    orderflow_score = orderflow.get('imbalance', 0)
+                    orderflow_normalized = (orderflow_score + 1) / 2
 
-                    if fake_breakout:
-                        push_log(f"[{symbol}] FAKE BREAKOUT detected - skipping")
-                        time.sleep(2)
-                        continue
+                    # ML prediction
+                    btc_df = scanner._get_btc_df()
+                    btc_direction = 0
+                    if btc_df is not None and len(btc_df) >= 6:
+                        btc_direction = (btc_df.iloc[-1]['close'] - btc_df.iloc[-6]['close']) / btc_df.iloc[-6]['close']
 
-                    # ML prediction filter
-                    latest = df.iloc[-1]
                     ml_features = {
                         'trend_strength': best.get('trend', 0) / 30.0,
                         'volume_ratio': best.get('volume', 0) / 25.0,
                         'volatility': scanner._estimate_atr_pct(df),
                         'rsi': latest.get('rsi', 50),
-                        'btc_direction': 0
+                        'btc_direction': btc_direction,
+                        'orderbook_imbalance': orderflow_score,
+                        'distance_from_liquidity': 0,
+                        'breakout_strength': best.get('momentum', 0) / 20.0,
+                        'candle_momentum': abs(df.iloc[-1]['close'] - df.iloc[-1]['open']) / df.iloc[-1]['open'] * 100
                     }
 
                     ml_confidence = ml_predictor.predict_win_probability(ml_features)
 
-                    if ml_confidence < 0.55:
-                        push_log(f"[{symbol}] ML filter blocked (confidence {ml_confidence:.1%})")
+                    # WEIGHTED SCORING (no hard blocks)
+                    final_score = (
+                        model_confidence * 0.4 +
+                        ml_confidence * 0.3 +
+                        orderflow_normalized * 0.3
+                    )
+
+                    if final_score < 0.65:
+                        push_log(f"[{symbol}] Score too low ({final_score:.2f}) - skipping")
                         time.sleep(2)
                         continue
 
-                    # Final decision: execute if combined confidence high
-                    combined_confidence = (best_model['confidence'] + ml_confidence) / 2
-                    if combined_confidence < 0.60:
-                        push_log(f"[{symbol}] Combined confidence too low ({combined_confidence:.1%})")
-                        time.sleep(2)
-                        continue
+                    push_log(f"[{symbol}] FINAL SCORE: {final_score:.2f}/1.0 | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f}")
 
                     # AI filtering: check symbol tradeability
                     tradeable, ai_reason = ai_engine.is_symbol_tradeable(symbol)
@@ -337,24 +340,26 @@ def trading_loop():
                         continue
 
                     # BTC correlation check
-                    btc_df = scanner._get_btc_df()
-                    btc_direction = 0
                     if btc_df is not None and len(btc_df) >= 6:
                         btc_change = (btc_df.iloc[-1]['close'] - btc_df.iloc[-6]['close']) / btc_df.iloc[-6]['close'] * 100
                         btc_trend = 'bullish' if btc_change > 0.3 else ('bearish' if btc_change < -0.3 else 'neutral')
-                        btc_direction = btc_change / 100  # Normalize to -1 to 1 range
                         corr_ok, corr_reason = ai_engine.get_btc_correlation_advice(symbol, btc_trend)
                         if not corr_ok:
                             push_log(f"[#{cycle}] Correlation warning: {corr_reason}")
                             time.sleep(2)
                             continue
 
-                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} | Model: {best_model['reason']}")
-                    push_log(f"  Orderflow: {orderflow['bias']} ({orderflow['imbalance']}) | ML: {ml_confidence:.1%} | Combined: {combined_confidence:.1%}")
+                    # Micro-confirmation check
+                    if not scanner._micro_confirm_entry(df, best_model['signal']):
+                        push_log(f"[{symbol}] Waiting for confirmation candle...")
+                        time.sleep(INTERVAL)
+                        continue
+
+                    push_log(f"[#{cycle}] FOUND: {symbol} {best_model['signal'].upper()} | Model: {best_model['reason']}")
                     state['active_pair']  = symbol
                     state['last_signal']  = best
 
-                    _execute_trade(side, int(combined_confidence * 100), symbol)
+                    _execute_trade(best_model['signal'], int(final_score * 100), symbol)
                 else:
                     push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
@@ -400,12 +405,16 @@ def _execute_trade(side: str, strength: int, symbol: str):
         # Dynamic position sizing: risk 2-5% based on confidence
         risk_pct = RISK_PER_TRADE
         if strength >= 85:
-            risk_pct = RISK_PER_TRADE * 1.5  # Increase for very high confidence
+            risk_pct = RISK_PER_TRADE * 1.5
         elif strength < 75:
-            risk_pct = RISK_PER_TRADE * 0.7  # Reduce for marginal setups
+            risk_pct = RISK_PER_TRADE * 0.7
 
-        # Calculate position size from stop-loss distance
-        sl_pct = CONFIG.get('stop_loss_percent', 0.3) / 100
+        # Dynamic stop loss based on volatility
+        atr_pct = scanner._estimate_atr_pct(df) if df is not None else 1.0
+        if atr_pct > 2.0:
+            sl_pct = CONFIG.get('stop_loss_volatile', 0.7) / 100
+        else:
+            sl_pct = CONFIG.get('stop_loss_base', 0.35) / 100
         margin_usd = (usdt * risk_pct / 100) / sl_pct if sl_pct > 0 else usdt * 0.03
 
         # Cap margin at available balance
