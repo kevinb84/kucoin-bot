@@ -25,6 +25,7 @@ from src.risk.advanced_risk_manager import AdvancedRiskManager
 from src.learning.trade_journal import TradeJournal
 from src.learning.compounding_engine import CompoundingEngine
 from src.strategy.market_intelligence import MarketIntelligence
+from src.learning.adaptive_intelligence import AdaptiveIntelligenceEngine
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,6 +74,7 @@ risk_mgr   = AdvancedRiskManager(CONFIG)
 intel      = MarketIntelligence(client)
 compounder = CompoundingEngine(starting_balance=45.0, risk_pct=RISK_PER_TRADE * 10)
 scanner    = AdvancedMarketScanner(client, strategy, intel, timeframe=TF)
+ai_engine  = AdaptiveIntelligenceEngine(journal, scanner, CONFIG)
 
 bot_thread    = None
 market_thread = None
@@ -122,6 +124,7 @@ def update_performance():
     state['performance']   = journal.get_trade_statistics()
     state['compounding']   = compounder.get_stats()
     state['scanner_results'] = scanner.get_watchlist_status()
+    state['ai_learning']   = ai_engine.get_learning_summary()
     state['intelligence']  = {
         'flash_crash_cooldown': intel.flash_crash_cooldown,
         'consecutive_losses':  intel.consecutive_losses,
@@ -253,7 +256,33 @@ def trading_loop():
                     score  = best['total_score']
                     reason = best.get('reason', '')[:100]
 
-                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} score={score}/100")
+                    # AI filtering: check symbol tradeability
+                    tradeable, ai_reason = ai_engine.is_symbol_tradeable(symbol)
+                    if not tradeable:
+                        push_log(f"[#{cycle}] SKIPPED {symbol}: {ai_reason}")
+                        time.sleep(2)
+                        continue
+
+                    # Check session quality
+                    session_info = intel.get_session_info()
+                    should_trade_sess, sess_reason = ai_engine.should_trade_this_session(session_info.get('session', 'unknown'))
+                    if not should_trade_sess:
+                        push_log(f"[#{cycle}] Session blocked: {sess_reason}")
+                        time.sleep(5)
+                        continue
+
+                    # BTC correlation check
+                    btc_df = scanner._get_btc_df()
+                    if btc_df is not None and len(btc_df) >= 6:
+                        btc_change = (btc_df.iloc[-1]['close'] - btc_df.iloc[-6]['close']) / btc_df.iloc[-6]['close'] * 100
+                        btc_trend = 'bullish' if btc_change > 0.3 else ('bearish' if btc_change < -0.3 else 'neutral')
+                        corr_ok, corr_reason = ai_engine.get_btc_correlation_advice(symbol, btc_trend)
+                        if not corr_ok:
+                            push_log(f"[#{cycle}] Correlation warning: {corr_reason}")
+                            time.sleep(2)
+                            continue
+
+                    push_log(f"[#{cycle}] FOUND: {symbol} {side.upper()} score={score}/100 | AI: {ai_reason}")
                     push_log(f"  Reason: {reason}")
                     state['active_pair']  = symbol
                     state['last_signal']  = best
@@ -373,8 +402,41 @@ def _close_trade(exit_price: float, reason: str, symbol: str):
                 compounder.record_trade(pnl, side, symbol)
                 intel.record_trade_result(won=(pnl >= 0))
                 scanner.record_trade_result(symbol, won=(pnl >= 0), pnl=pnl)
+
+                # Record in adaptive AI engine with full context
+                session_info = intel.get_session_info()
+                btc_df = scanner._get_btc_df()
+                market_regime = ai_engine.detect_market_regime(btc_df) if btc_df is not None else 'unknown'
+                btc_trend = 'neutral'
+                if btc_df is not None and len(btc_df) >= 6:
+                    btc_change = (btc_df.iloc[-1]['close'] - btc_df.iloc[-6]['close']) / btc_df.iloc[-6]['close'] * 100
+                    if btc_change > 0.3:
+                        btc_trend = 'bullish'
+                    elif btc_change < -0.3:
+                        btc_trend = 'bearish'
+
+                ai_engine.record_trade({
+                    'symbol': symbol,
+                    'side': side,
+                    'entry_price': result.get('entry_price', 0),
+                    'exit_price': exit_price,
+                    'pnl': pnl,
+                    'pnl_percent': result.get('pnl_percent', 0),
+                    'strategy_used': 'trend_following',  # Could be dynamic based on signal type
+                    'signal_strength': result.get('signal_strength', 0),
+                    'session': session_info.get('session', 'unknown'),
+                    'market_regime': market_regime,
+                    'btc_trend_at_entry': btc_trend,
+                })
+
                 tag = 'WIN ✓' if pnl >= 0 else 'LOSS ✗'
                 push_log(f"[{symbol}] [{tag}] {reason} | PnL: ${pnl:.4f}")
+
+                # Check for weekly report
+                report = ai_engine.check_and_generate_report()
+                if report:
+                    push_log("[AI] Weekly performance report generated")
+                    logger.info(report)
         else:
             push_log(f"[{symbol}] CLOSE FAILED!")
 
