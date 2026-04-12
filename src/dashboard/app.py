@@ -92,18 +92,26 @@ daily_pnl_start = 0.0
 daily_pnl_reset_date = None
 
 
-def get_trading_mode():
+def get_trading_mode(effective_threshold=SCORE_THRESHOLD):
     """Determine current trading mode based on performance."""
     daily_pnl = risk_mgr.daily_pnl or 0
     max_daily_loss = CONFIG.get('max_daily_loss', 7.0)
-    
+
+    # Quality priority: if recent losses, raise threshold
+    if len(ai_engine.recent_trades) >= 5:
+        last_5 = ai_engine.recent_trades[-5:]
+        loss_count = sum(1 for t in last_5 if not t.get('won', False))
+        if loss_count >= 3:
+            effective_threshold += 0.05
+            push_log(f"[v7] QUALITY MODE: {loss_count}/5 losses — raising threshold to {effective_threshold:.2f}")
+
     if daily_pnl < -max_daily_loss:
-        return 'DEFENSIVE'
+        return 'DEFENSIVE', effective_threshold
     elif ai_engine.recent_trades and len(ai_engine.recent_trades) >= 10:
         recent_wr = sum(1 for t in ai_engine.recent_trades[-10:] if t.get('won')) / 10
         if recent_wr > 0.60:
-            return 'AGGRESSIVE'
-    return 'NORMAL'
+            return 'AGGRESSIVE', effective_threshold
+    return 'NORMAL', effective_threshold
 
 
 def reset_daily_pnl_if_needed():
@@ -236,7 +244,22 @@ def trading_loop():
         try:
             reset_daily_pnl_if_needed()
 
-            trading_mode = get_trading_mode()
+            # Trade frequency control
+            now = time.time()
+            recent_trades_1h = [t for t in ai_engine.recent_trades if now - t['timestamp'] < 3600]
+            if len(recent_trades_1h) >= 5:
+                push_log(f"[v7] RATE LIMIT: 5 trades in last hour — waiting...")
+                time.sleep(INTERVAL * 2)
+                continue
+
+            # Minimum 3 min between trades
+            if ai_engine.recent_trades:
+                last_trade_ts = ai_engine.recent_trades[-1]['timestamp']
+                if now - last_trade_ts < 180:
+                    time.sleep(10)
+                    continue
+
+            trading_mode, effective_threshold = get_trading_mode()
 
             if trading_mode == 'DEFENSIVE':
                 daily_pnl = risk_mgr.daily_pnl or 0
@@ -248,7 +271,6 @@ def trading_loop():
                 effective_threshold = 0.58
             else:
                 effective_risk_pct = RISK_PER_TRADE
-                effective_threshold = SCORE_THRESHOLD
 
             last_trade_time = ai_engine.recent_trades[-1]['timestamp'] if ai_engine.recent_trades else 0
             hours_since_trade = (time.time() - last_trade_time) / 3600 if last_trade_time > 0 else 999
@@ -390,8 +412,14 @@ def trading_loop():
                     )
 
                     push_log(f"[{symbol}] Score: {final_score:.2f}/{effective_threshold:.2f} | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f} | Mode:{trading_mode}")
-                    if final_score < effective_threshold:
-                        push_log(f"[{symbol}] REJECTED: Score too low")
+
+                    # Force scan safety floor
+                    if force_mode and final_score < 0.60:
+                        if model_confidence < 0.65 and orderflow_normalized < 0.60:
+                            push_log(f"[{symbol}] FORCE SCAN REJECTED: Model ({model_confidence:.2f}) and Orderflow ({orderflow_normalized:.2f}) too weak")
+                            time.sleep(2)
+                            continue
+                        push_log(f"[{symbol}] FORCE SCAN OVERRIDE: Executing based on strong {'Model' if model_confidence >= 0.65 else 'Orderflow'}")
 
                     if not force_mode and final_score < effective_threshold:
                         push_log(f"[{symbol}] Score too low ({final_score:.2f} < {effective_threshold}) - skipping")
@@ -438,7 +466,7 @@ def trading_loop():
                     # Don't store 'best' in state (contains non-serializable data)
                     # state['last_signal']  = best
 
-                    _execute_trade(best_model['signal'], final_score, symbol, df, effective_risk_pct)
+                    _execute_trade(best_model['signal'], final_score, symbol, df, effective_risk_pct, trading_mode)
                 else:
                     push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
@@ -455,7 +483,7 @@ def trading_loop():
     push_log("Trading engine stopped")
 
 
-def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame, effective_risk_pct: float):
+def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame, effective_risk_pct: float, trading_mode: str):
     try:
         ticker = client.fetch_ticker(symbol)
         if not ticker:
@@ -477,6 +505,9 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
             return
 
         leverage = CONFIG.get('leverage', 10)
+        if leverage != 10:
+            push_log(f"[WARNING] Leverage is {leverage}x — overriding to 10x")
+            leverage = 10
         compounder.update_balance(usdt)
 
         risk_pct = effective_risk_pct
@@ -519,27 +550,32 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         else:
             trailing_distance = CONFIG.get('trailing_stop_distance', 0.25) / 100
 
-        # Minimum profit filter: skip if expected profit < $1.00
-        expected_profit_usd = margin_usd * leverage * tp_pct
-        if expected_profit_usd < 1.0:
-            push_log(f"[{symbol}] SKIPPED: Expected profit ${expected_profit_usd:.2f} too small (min $1.00)")
+        # Strict profit enforcement: expected profit AFTER fees
+        entry_fee = margin_usd * leverage * KUCOIN_FEE_RATE
+        exit_fee = margin_usd * leverage * tp_pct * KUCOIN_FEE_RATE
+        total_fees = entry_fee + exit_fee
+        expected_gross_profit = margin_usd * leverage * tp_pct
+        expected_net_profit = expected_gross_profit - total_fees
+
+        if expected_net_profit < 1.0:
+            push_log(f"[{symbol}] REJECTED: Net profit ${expected_net_profit:.2f} < $1.00 (fees: ${total_fees:.2f})")
+            return
+
+        # Ensure TP distance > 3× total fees
+        fee_pct = KUCOIN_FEE_RATE * 2
+        if tp_pct < fee_pct * 3:
+            push_log(f"[{symbol}] REJECTED: TP ({tp_pct:.2%}) < 3× fees ({fee_pct*3:.2%})")
             return
 
         sl = round(price * (1 - sl_pct if side == 'buy' else 1 + sl_pct), 8)
         tp = round(price * (1 + tp_pct if side == 'buy' else 1 - tp_pct), 8)
-
-        # Fee check: ensure profit > 3x fees
-        expected_profit_pct = tp_pct * 100
-        fee_cost_pct = KUCOIN_FEE_RATE * 2 * 100 * leverage
-        if expected_profit_pct < fee_cost_pct * 3:
-            push_log(f"[{symbol}] SKIPPED: Expected profit ({expected_profit_pct:.2f}%) < 3x fees ({fee_cost_pct*3:.2f}%)")
-            return
 
         push_log(f"[{symbol}] {side.upper()} {contracts} contracts @ {price:.6f} | margin=${margin_usd:.2f} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% Trail:{trailing_distance*100:.2f}%")
 
         order = client.create_order(symbol=symbol, order_type='market', side=side, amount=contracts)
         if order:
             push_log(f"[{symbol}] ORDER FILLED! ID:{order.get('id','?')}")
+            push_log(f"[{symbol}] EXECUTED: Score={final_score:.2f} | Lev={leverage}x | ExpProfit=${expected_net_profit:.2f} | Mode={trading_mode}")
             risk_mgr.open_trade({
                 'symbol': symbol, 'side': side, 'entry_price': price,
                 'quantity': contracts, 'leverage': leverage,
