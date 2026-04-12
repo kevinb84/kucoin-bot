@@ -381,6 +381,9 @@ def trading_loop():
                     best_model = max(models, key=lambda x: x['confidence'])
 
                     model_confidence = best_model['confidence']
+                    push_log(f"[v7] Model confidence: {model_confidence:.2f} | Checking entry models...")
+                    if model_confidence == 0.0:
+                        push_log(f"[v7] WARNING: All entry models returned 0.0 — market conditions may not match any setup")
 
                     # Order flow analysis
                     orderflow = order_analyzer.analyze_orderbook_imbalance(symbol)
@@ -486,6 +489,54 @@ def trading_loop():
                 else:
                     push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
+                    
+                    # If force mode and still no trades after full scan, execute best available
+                    if force_mode:
+                        push_log(f"[v7] FORCE MODE: No model-triggered setups found — executing highest scoring pair")
+                        best_fallback = None
+                        best_fallback_score = 0
+                        
+                        for sym, cached in scanner.scan_cache.items():
+                            score = cached.get('total_score', 0)
+                            if score > best_fallback_score:
+                                best_fallback = cached
+                                best_fallback_score = score
+                        
+                        if best_fallback and best_fallback_score > 0.50:
+                            fb_symbol = best_fallback['symbol']
+                            fb_side = best_fallback['signal']
+                            fb_df = best_fallback.get('df')
+                            
+                            ticker = client.fetch_ticker(fb_symbol)
+                            if ticker and float(ticker.get('last', 0)) > 0:
+                                fb_price = float(ticker['last'])
+                                bal = client.fetch_balance()
+                                if bal:
+                                    usdt = float(bal.get('USDT', {}).get('free', 0) or 0)
+                                    leverage = CONFIG.get('leverage', 10)
+                                    fb_atr = scanner._estimate_atr_pct(fb_df) if fb_df is not None else 1.0
+                                    fb_tp_pct = CONFIG.get('tp_normal', 0.8) / 100
+                                    fb_entry_fee = usdt * 0.03 * leverage * KUCOIN_FEE_RATE
+                                    fb_exit_fee = usdt * 0.03 * leverage * fb_tp_pct * KUCOIN_FEE_RATE
+                                    fb_expected_net = (usdt * 0.03 * leverage * fb_tp_pct) - (fb_entry_fee + fb_exit_fee)
+                                    
+                                    if fb_expected_net > 1.00:
+                                        push_log(f"[v7] FORCE EXECUTING: {fb_symbol} score={best_fallback_score:.2f} expected_net=${fb_expected_net:.2f}")
+                                        _execute_trade(
+                                            fb_side,
+                                            best_fallback_score,
+                                            fb_symbol,
+                                            fb_df,
+                                            effective_risk_pct * 0.5
+                                        )
+                                    else:
+                                        push_log(f"[v7] FORCE MODE REJECTED: {fb_symbol} expected net profit ${fb_expected_net:.2f} < $1.00")
+                                else:
+                                    push_log(f"[v7] FORCE MODE: Cannot fetch balance for fallback")
+                            else:
+                                push_log(f"[v7] FORCE MODE: Cannot fetch ticker for {fb_symbol}")
+                        else:
+                            push_log(f"[v7] FORCE MODE: No suitable fallback found (best score: {best_fallback_score:.2f})")
             else:
                 push_log(f"[#{cycle}] Max positions ({MAX_POSITIONS}) reached. Managing open trades...")
                 state['active_pair'] = f'{open_count} positions open'
