@@ -1,8 +1,9 @@
 """
-KuCoin AI Trader v7
-Weighted scoring: Model (40%) + ML (30%) + Orderflow (30%)
-Threshold: 0.65 | Micro-confirmation mandatory
-Dynamic SL/TP/Trailing based on volatility
+KuCoin AI Trader v7.1
+Adaptive scoring: Model(40-60%) + ML(10-30%) + Orderflow(30%)
+Threshold: 0.65 (dynamic based on mode/activity)
+Defensive mode on daily loss | Force scan after 3h inactivity
+Micro-confirmation skips in low volatility (ATR < 1%)
 Max 3 positions | 7% daily stop loss
 """
 
@@ -91,6 +92,20 @@ daily_pnl_start = 0.0
 daily_pnl_reset_date = None
 
 
+def get_trading_mode():
+    """Determine current trading mode based on performance."""
+    daily_pnl = risk_mgr.daily_pnl or 0
+    max_daily_loss = CONFIG.get('max_daily_loss', 7.0)
+    
+    if daily_pnl < -max_daily_loss:
+        return 'DEFENSIVE'
+    elif ai_engine.recent_trades and len(ai_engine.recent_trades) >= 10:
+        recent_wr = sum(1 for t in ai_engine.recent_trades[-10:] if t.get('won')) / 10
+        if recent_wr > 0.60:
+            return 'AGGRESSIVE'
+    return 'NORMAL'
+
+
 def reset_daily_pnl_if_needed():
     global daily_pnl_start, daily_pnl_reset_date
     today = datetime.now().date()
@@ -100,21 +115,6 @@ def reset_daily_pnl_if_needed():
         state['daily_pnl'] = 0.0
         state['daily_stop_hit'] = False
         push_log(f"[v7] Daily PnL reset. Starting balance: ${daily_pnl_start:.2f}")
-
-
-def check_daily_stop() -> bool:
-    global daily_pnl_start
-    if state['daily_stop_hit']:
-        return True
-    current_balance = compounder.get_stats().get('current_balance', 45.0)
-    daily_loss = daily_pnl_start - current_balance
-    daily_loss_pct = (daily_loss / daily_pnl_start) * 100 if daily_pnl_start > 0 else 0
-    state['daily_pnl'] = -daily_loss
-    if daily_loss_pct >= DAILY_STOP_PCT:
-        state['daily_stop_hit'] = True
-        push_log(f"[v7] DAILY STOP HIT! Loss: {daily_loss_pct:.2f}% (limit: {DAILY_STOP_PCT}%)")
-        return True
-    return False
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -236,10 +236,32 @@ def trading_loop():
         try:
             reset_daily_pnl_if_needed()
 
-            if check_daily_stop():
-                push_log("[v7] Daily stop active - no new trades until reset")
-                time.sleep(INTERVAL * 4)
-                continue
+            trading_mode = get_trading_mode()
+
+            if trading_mode == 'DEFENSIVE':
+                daily_pnl = risk_mgr.daily_pnl or 0
+                push_log(f"[v7] DEFENSIVE MODE: Daily loss {daily_pnl:.2f}% — reducing risk to 1%, raising threshold")
+                effective_risk_pct = 1.0
+                effective_threshold = 0.70
+            elif trading_mode == 'AGGRESSIVE':
+                effective_risk_pct = RISK_PER_TRADE * 1.5
+                effective_threshold = 0.58
+            else:
+                effective_risk_pct = RISK_PER_TRADE
+                effective_threshold = SCORE_THRESHOLD
+
+            last_trade_time = ai_engine.recent_trades[-1]['timestamp'] if ai_engine.recent_trades else 0
+            hours_since_trade = (time.time() - last_trade_time) / 3600 if last_trade_time > 0 else 999
+
+            if hours_since_trade > 2:
+                effective_threshold = max(0.55, effective_threshold - 0.05)
+                push_log(f"[v7] INACTIVITY DETECTED ({hours_since_trade:.1f}h) — lowering threshold to {effective_threshold:.2f}")
+
+            if hours_since_trade > 3:
+                push_log(f"[v7] FORCE SCAN MODE: Executing best available setup")
+                force_mode = True
+            else:
+                force_mode = False
 
             state['cycle'] += 1
             cycle = state['cycle']
@@ -351,22 +373,35 @@ def trading_loop():
 
                     ml_confidence = ml_predictor.predict_win_probability(ml_features)
 
-                    # WEIGHTED SCORING: Model (40%) + ML (30%) + Orderflow (30%)
+                    total_trades_count = len(ai_engine.recent_trades)
+                    if total_trades_count < 30:
+                        ml_weight = 0.10
+                        model_weight = 0.60
+                        of_weight = 0.30
+                    else:
+                        ml_weight = 0.30
+                        model_weight = 0.40
+                        of_weight = 0.30
+
                     final_score = (
-                        model_confidence * 0.4 +
-                        ml_confidence * 0.3 +
-                        orderflow_normalized * 0.3
+                        model_confidence * model_weight +
+                        ml_confidence * ml_weight +
+                        orderflow_normalized * of_weight
                     )
 
-                    if final_score < SCORE_THRESHOLD:
-                        push_log(f"[{symbol}] Score too low ({final_score:.2f} < {SCORE_THRESHOLD}) - skipping")
+                    push_log(f"[{symbol}] Score: {final_score:.2f}/{effective_threshold:.2f} | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f} | Mode:{trading_mode}")
+                    if final_score < effective_threshold:
+                        push_log(f"[{symbol}] REJECTED: Score too low")
+
+                    if not force_mode and final_score < effective_threshold:
+                        push_log(f"[{symbol}] Score too low ({final_score:.2f} < {effective_threshold}) - skipping")
                         time.sleep(2)
                         continue
 
                     push_log(f"[{symbol}] FINAL SCORE: {final_score:.2f} | Model:{model_confidence:.2f} ML:{ml_confidence:.2f} OF:{orderflow_normalized:.2f}")
 
-                    # Micro-confirmation MANDATORY
-                    if not scanner._micro_confirm_entry(df, best_model['signal']):
+                    atr_pct = scanner._estimate_atr_pct(df)
+                    if not scanner._micro_confirm_entry(df, best_model['signal'], atr_pct):
                         push_log(f"[{symbol}] Micro-confirmation FAILED - waiting")
                         time.sleep(INTERVAL)
                         continue
@@ -403,7 +438,7 @@ def trading_loop():
                     # Don't store 'best' in state (contains non-serializable data)
                     # state['last_signal']  = best
 
-                    _execute_trade(best_model['signal'], final_score, symbol, df)
+                    _execute_trade(best_model['signal'], final_score, symbol, df, effective_risk_pct)
                 else:
                     push_log(f"[#{cycle}] No qualifying setups. Waiting...")
                     state['active_pair'] = 'Waiting for setup...'
@@ -420,7 +455,7 @@ def trading_loop():
     push_log("Trading engine stopped")
 
 
-def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame):
+def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame, effective_risk_pct: float):
     try:
         ticker = client.fetch_ticker(symbol)
         if not ticker:
@@ -444,12 +479,11 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame)
         leverage = CONFIG.get('leverage', 10)
         compounder.update_balance(usdt)
 
-        # Dynamic position sizing: risk 2-5% based on confidence
-        risk_pct = RISK_PER_TRADE
+        risk_pct = effective_risk_pct
         if final_score >= 0.80:
-            risk_pct = RISK_PER_TRADE * 1.5
+            risk_pct = effective_risk_pct * 1.5
         elif final_score < 0.70:
-            risk_pct = RISK_PER_TRADE * 0.7
+            risk_pct = effective_risk_pct * 0.7
 
         # Dynamic stop loss based on volatility
         atr_pct = scanner._estimate_atr_pct(df) if df is not None else 1.0

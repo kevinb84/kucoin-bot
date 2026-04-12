@@ -309,11 +309,14 @@ class AdvancedMarketScanner:
         
         return {'signal': 'hold', 'confidence': 0, 'reason': 'No momentum spike'}
 
-    def _micro_confirm_entry(self, df, signal: str) -> bool:
+    def _micro_confirm_entry(self, df, signal: str, atr_pct: float = None) -> bool:
         """
         Wait for confirmation candle before entering.
         Reduces false entries from liquidity grabs/breakouts.
         """
+        if atr_pct is not None and atr_pct < 1.0:
+            return True
+        
         if len(df) < 3:
             return False
         
