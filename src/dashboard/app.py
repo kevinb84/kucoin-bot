@@ -105,6 +105,18 @@ def get_trading_mode(effective_threshold=SCORE_THRESHOLD):
             effective_threshold += 0.05
             push_log(f"[v7] QUALITY MODE: {loss_count}/5 losses — raising threshold to {effective_threshold:.2f}")
 
+    # Performance feedback: adjust threshold based on recent win rate
+    if len(ai_engine.recent_trades) >= 10:
+        last_10 = ai_engine.recent_trades[-10:]
+        recent_wr = sum(1 for t in last_10 if t['won']) / 10
+
+        if recent_wr < 0.40:
+            effective_threshold += 0.05
+            push_log(f"[v7] POOR PERFORMANCE (WR {recent_wr:.0%}) — raising threshold to {effective_threshold:.2f}")
+        elif recent_wr > 0.65:
+            effective_threshold = max(0.55, effective_threshold - 0.03)
+            push_log(f"[v7] STRONG PERFORMANCE (WR {recent_wr:.0%}) — lowering threshold to {effective_threshold:.2f}")
+
     if daily_pnl < -max_daily_loss:
         return 'DEFENSIVE', effective_threshold
     elif ai_engine.recent_trades and len(ai_engine.recent_trades) >= 10:
@@ -421,6 +433,10 @@ def trading_loop():
                             continue
                         push_log(f"[{symbol}] FORCE SCAN OVERRIDE: Executing based on strong {'Model' if model_confidence >= 0.65 else 'Orderflow'}")
 
+                    if force_mode:
+                        push_log(f"[v7] FORCE MODE TRADE EXECUTED | Model:{model_confidence:.2f} OF:{orderflow_normalized:.2f}")
+                        state['force_mode_trades'] = state.get('force_mode_trades', 0) + 1
+
                     if not force_mode and final_score < effective_threshold:
                         push_log(f"[{symbol}] Score too low ({final_score:.2f} < {effective_threshold}) - skipping")
                         time.sleep(2)
@@ -508,6 +524,15 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         if leverage != 10:
             push_log(f"[WARNING] Leverage is {leverage}x — overriding to 10x")
             leverage = 10
+
+        # Volatility-based leverage adjustment
+        atr_pct = scanner._estimate_atr_pct(df) if df is not None else 1.0
+        if atr_pct > 2.0:
+            leverage = 5
+            push_log(f"[{symbol}] High volatility (ATR {atr_pct:.1f}%) — reducing leverage to 5x")
+        else:
+            leverage = CONFIG.get('leverage', 10)
+
         compounder.update_balance(usdt)
 
         risk_pct = effective_risk_pct
@@ -527,6 +552,15 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         # Cap margin at available balance
         margin_usd = min(margin_usd, usdt * 0.4)
         margin_usd = max(margin_usd, 5.0)
+
+        # Edge optimization: reduce size for low-edge strategies
+        edge_scores = ai_engine.get_edge_quality_scores()
+        current_strategy = 'trend_following'
+        strategy_edge = edge_scores.get(current_strategy, 0)
+
+        if strategy_edge < 0.5:
+            margin_usd *= 0.7
+            push_log(f"[{symbol}] Low edge strategy (${strategy_edge:.2f}/trade) — reducing size 30%")
 
         # Apply loss limiter
         loss_check = intel.check_loss_limit()
@@ -557,8 +591,11 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         expected_gross_profit = margin_usd * leverage * tp_pct
         expected_net_profit = expected_gross_profit - total_fees
 
-        if expected_net_profit < 1.0:
-            push_log(f"[{symbol}] REJECTED: Net profit ${expected_net_profit:.2f} < $1.00 (fees: ${total_fees:.2f})")
+        # Dynamic profit target: max($1, 0.5% of balance)
+        min_profit_dynamic = max(1.0, usdt * 0.005)
+
+        if expected_net_profit < min_profit_dynamic:
+            push_log(f"[{symbol}] REJECTED: Net profit ${expected_net_profit:.2f} < ${min_profit_dynamic:.2f} (dynamic min)")
             return
 
         # Ensure TP distance > 3× total fees
