@@ -502,6 +502,22 @@ def trading_loop():
                                 best_fallback = cached
                                 best_fallback_score = score
                         
+                        if best_fallback_score == 0.0:
+                            push_log(f"[v7] All scores 0.0 — using volume/volatility fallback scoring")
+                            for sym in scanner.active_symbols:
+                                try:
+                                    df_temp = client.fetch_ohlcv(sym, TF, limit=20)
+                                    if df_temp is None or df_temp.empty:
+                                        continue
+                                    vol_ratio = df_temp['volume'].iloc[-1] / df_temp['volume'].mean()
+                                    atr_pct = scanner._estimate_atr_pct(df_temp)
+                                    fallback_score = min((vol_ratio * atr_pct) * 10, 5.0)
+                                    if fallback_score > best_fallback_score:
+                                        best_fallback_score = fallback_score
+                                        best_fallback = {'symbol': sym, 'total_score': fallback_score, 'signal': 'buy', 'df': df_temp}
+                                except:
+                                    continue
+
                         if best_fallback and best_fallback_score > 0.50:
                             fb_symbol = best_fallback['symbol']
                             fb_side = best_fallback['signal']
@@ -642,8 +658,13 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         expected_gross_profit = margin_usd * leverage * tp_pct
         expected_net_profit = expected_gross_profit - total_fees
 
-        # Dynamic profit target: max($1, 0.5% of balance)
-        min_profit_dynamic = max(1.0, usdt * 0.005)
+        # Dynamic profit target scaled to balance
+        if usdt < 100:
+            min_profit_dynamic = max(0.10, usdt * 0.002)  # $0.10 min for small accounts
+        elif usdt < 500:
+            min_profit_dynamic = max(0.50, usdt * 0.003)
+        else:
+            min_profit_dynamic = max(1.0, usdt * 0.005)
 
         if expected_net_profit < min_profit_dynamic:
             push_log(f"[{symbol}] REJECTED: Net profit ${expected_net_profit:.2f} < ${min_profit_dynamic:.2f} (dynamic min)")

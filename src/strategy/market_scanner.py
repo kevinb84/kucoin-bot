@@ -371,9 +371,14 @@ class AdvancedMarketScanner:
             # Calculate minimum profitable move (3x fees)
             min_move_pct = (KUCOIN_FEE_RATE * 2 * 3) * 100  # ~0.36%
             
+            total_score = int(best_model['confidence'] * 100)
+            
+            if total_score == 0:
+                logger.debug(f"[Scorer] {symbol} scored 0/100 | Trend:{trend_strength} Vol:{volume_ratio * 25} Volat:{self._estimate_atr_pct(df) * 5} Mom:0")
+
             return {
                 'symbol':         symbol,
-                'total_score':    int(best_model['confidence'] * 100),
+                'total_score':    total_score,
                 'trend':          trend_strength,
                 'volume':         volume_ratio * 25,
                 'volatility':     self._estimate_atr_pct(df) * 5,
