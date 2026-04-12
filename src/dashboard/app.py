@@ -658,11 +658,11 @@ def _execute_trade(side: str, final_score: float, symbol: str, df: pd.DataFrame,
         expected_gross_profit = margin_usd * leverage * tp_pct
         expected_net_profit = expected_gross_profit - total_fees
 
-        # Dynamic profit target scaled to balance
+        # Dynamic profit target scaled to balance (accounts for 0.12% total fees)
         if usdt < 100:
-            min_profit_dynamic = max(0.10, usdt * 0.002)  # $0.10 min for small accounts
+            min_profit_dynamic = max(0.30, usdt * 0.005)  # $0.30 min for small accounts
         elif usdt < 500:
-            min_profit_dynamic = max(0.50, usdt * 0.003)
+            min_profit_dynamic = max(0.75, usdt * 0.004)
         else:
             min_profit_dynamic = max(1.0, usdt * 0.005)
 
