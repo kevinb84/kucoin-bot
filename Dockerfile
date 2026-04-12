@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Run the app
-CMD ["python", "src/dashboard/app.py"]
+CMD ["python", "src/dashboard/app.py"]# Rebuild Sun Apr 12 16:09:41 MST 2026
